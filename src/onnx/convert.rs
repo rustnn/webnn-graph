@@ -1441,17 +1441,19 @@ impl OnnxConverter {
                                 if attr.name.as_str() == "value" {
                                     if let Some(value_tensor) = attr.t.as_ref() {
                                         if value_tensor.data_type
-                                        == crate::protos::onnx::TensorProto_DataType::Int64 as i32
-                                    {
-                                        let raw = value_tensor.raw_data.as_slice();
-                                        if !raw.is_empty() && raw.len() >= 8 {
-                                            fill_value = i64::from_le_bytes([
-                                                raw[0], raw[1], raw[2], raw[3], raw[4], raw[5],
-                                                raw[6], raw[7],
-                                            ]);
-                                        } else if !value_tensor.int64_data.as_slice().is_empty() {
-                                            fill_value = value_tensor.int64_data.as_slice()[0];
-                                        }
+                                            == crate::protos::onnx::TensorProto_DataType::Int64
+                                                as i32
+                                        {
+                                            let raw = value_tensor.raw_data.as_slice();
+                                            if !raw.is_empty() && raw.len() >= 8 {
+                                                fill_value = i64::from_le_bytes([
+                                                    raw[0], raw[1], raw[2], raw[3], raw[4], raw[5],
+                                                    raw[6], raw[7],
+                                                ]);
+                                            } else if !value_tensor.int64_data.as_slice().is_empty()
+                                            {
+                                                fill_value = value_tensor.int64_data.as_slice()[0];
+                                            }
                                         }
                                     }
                                 }

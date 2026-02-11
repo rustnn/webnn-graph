@@ -69,32 +69,33 @@ impl EvaluatorTrait for ConstantOfShapeEvaluator {
                 if let Some(value_tensor) = attr.t.as_ref() {
                     data_type = value_tensor.data_type;
 
-                match data_type {
-                    x if x == TensorProto_DataType::Int64 as i32 => {
-                        let raw = value_tensor.raw_data.as_slice();
-                        if !raw.is_empty() && raw.len() >= 8 {
-                            fill_value_i64 = i64::from_le_bytes([
-                                raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6], raw[7],
-                            ]);
-                        } else if !value_tensor.int64_data.as_slice().is_empty() {
-                            fill_value_i64 = value_tensor.int64_data.as_slice()[0];
+                    match data_type {
+                        x if x == TensorProto_DataType::Int64 as i32 => {
+                            let raw = value_tensor.raw_data.as_slice();
+                            if !raw.is_empty() && raw.len() >= 8 {
+                                fill_value_i64 = i64::from_le_bytes([
+                                    raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6], raw[7],
+                                ]);
+                            } else if !value_tensor.int64_data.as_slice().is_empty() {
+                                fill_value_i64 = value_tensor.int64_data.as_slice()[0];
+                            }
+                        }
+                        x if x == TensorProto_DataType::Float as i32 => {
+                            let raw = value_tensor.raw_data.as_slice();
+                            if !raw.is_empty() && raw.len() >= 4 {
+                                fill_value_f32 =
+                                    f32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]);
+                            } else if !value_tensor.float_data.as_slice().is_empty() {
+                                fill_value_f32 = value_tensor.float_data.as_slice()[0];
+                            }
+                        }
+                        _ => {
+                            return Err(OnnxError::ShapeInference(format!(
+                                "Unsupported data type for ConstantOfShape value: {:?}",
+                                data_type
+                            )))
                         }
                     }
-                    x if x == TensorProto_DataType::Float as i32 => {
-                        let raw = value_tensor.raw_data.as_slice();
-                        if !raw.is_empty() && raw.len() >= 4 {
-                            fill_value_f32 = f32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]);
-                        } else if !value_tensor.float_data.as_slice().is_empty() {
-                            fill_value_f32 = value_tensor.float_data.as_slice()[0];
-                        }
-                    }
-                    _ => {
-                        return Err(OnnxError::ShapeInference(format!(
-                            "Unsupported data type for ConstantOfShape value: {:?}",
-                            data_type
-                        )))
-                    }
-                }
                 }
             }
         }

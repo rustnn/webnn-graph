@@ -319,36 +319,36 @@ impl UtilityHandler {
             if attr.name.as_str() == "value" {
                 if let Some(t) = attr.t.as_ref() {
                     match t.data_type {
-                    // FLOAT
-                    x if x == crate::protos::onnx::TensorProto_DataType::Float as i32 => {
-                        dtype = DataType::Float32;
-                        if !t.float_data.as_slice().is_empty() {
-                            fill_value_i64 = t.float_data.as_slice()[0].to_bits() as i64;
-                        } else if !t.raw_data.as_slice().is_empty()
-                            && t.raw_data.as_slice().len() >= 4
-                        {
-                            let raw = &t.raw_data.as_slice()[..4];
-                            let bits = u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]);
-                            fill_value_i64 = bits as i64;
-                        } else {
-                            fill_value_i64 = 0f32.to_bits() as i64;
+                        // FLOAT
+                        x if x == crate::protos::onnx::TensorProto_DataType::Float as i32 => {
+                            dtype = DataType::Float32;
+                            if !t.float_data.as_slice().is_empty() {
+                                fill_value_i64 = t.float_data.as_slice()[0].to_bits() as i64;
+                            } else if !t.raw_data.as_slice().is_empty()
+                                && t.raw_data.as_slice().len() >= 4
+                            {
+                                let raw = &t.raw_data.as_slice()[..4];
+                                let bits = u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]);
+                                fill_value_i64 = bits as i64;
+                            } else {
+                                fill_value_i64 = 0f32.to_bits() as i64;
+                            }
                         }
-                    }
-                    // INT64
-                    x if x == crate::protos::onnx::TensorProto_DataType::Int64 as i32 => {
-                        dtype = DataType::Int64;
-                        if !t.int64_data.as_slice().is_empty() {
-                            fill_value_i64 = t.int64_data.as_slice()[0];
-                        } else if !t.raw_data.as_slice().is_empty()
-                            && t.raw_data.as_slice().len() >= 8
-                        {
-                            let raw = &t.raw_data.as_slice()[..8];
-                            fill_value_i64 = i64::from_le_bytes([
-                                raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6], raw[7],
-                            ]);
+                        // INT64
+                        x if x == crate::protos::onnx::TensorProto_DataType::Int64 as i32 => {
+                            dtype = DataType::Int64;
+                            if !t.int64_data.as_slice().is_empty() {
+                                fill_value_i64 = t.int64_data.as_slice()[0];
+                            } else if !t.raw_data.as_slice().is_empty()
+                                && t.raw_data.as_slice().len() >= 8
+                            {
+                                let raw = &t.raw_data.as_slice()[..8];
+                                fill_value_i64 = i64::from_le_bytes([
+                                    raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6], raw[7],
+                                ]);
+                            }
                         }
-                    }
-                    _ => {}
+                        _ => {}
                     }
                 }
             }
