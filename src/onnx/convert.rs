@@ -568,8 +568,7 @@ pub struct OnnxConverter {
 impl OnnxConverter {
     /// Create a new converter from an ONNX model
     pub fn new(model: ModelProto) -> Result<Self, OnnxError> {
-        let graph_name = if model.graph.is_some() {
-            let graph = model.graph.as_ref().unwrap();
+        let graph_name = if let Some(graph) = &model.graph {
             if !graph.name.is_empty() {
                 graph.name.as_str().to_string()
             } else {
@@ -727,8 +726,7 @@ impl OnnxConverter {
             }
 
             // Get type info
-            if input.r#type.is_some() {
-                let type_proto = input.r#type.as_ref().unwrap();
+            if let Some(type_proto) = &input.r#type {
                 if let Some(TypeProtoValue::TensorType(tensor_type)) = &type_proto.value {
                     let data_type = if tensor_type.elem_type != 0 {
                         let onnx_type = tensor_type.elem_type;
