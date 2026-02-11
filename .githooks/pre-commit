@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-echo "Running clippy..."
-cargo fmt --all -- --check
-cargo clippy -q --all-targets --all-features -- -D warnings
+echo "[pre-commit] make fmt-check"
+make fmt-check
+
+echo "[pre-commit] make lint"
+make lint
