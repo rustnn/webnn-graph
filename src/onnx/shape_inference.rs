@@ -1063,27 +1063,25 @@ mod tests {
             value: Some(tensor_shape_proto::dimension::Value::DimParam(
                 "batch".to_string(),
             )),
-            ..Default::default()
+            denotation: String::new(),
         };
         let shape = crate::protos::onnx::TensorShapeProto {
             dim: vec![dim],
-            ..Default::default()
         };
 
         let tensor_type = type_proto::Tensor {
             elem_type: crate::protos::onnx::TensorProto_DataType::Float.into(),
-            shape: Some(shape).into(),
-            ..Default::default()
+            shape: Some(shape),
         };
 
         let type_proto = crate::protos::onnx::TypeProto {
             value: Some(type_proto::Value::TensorType(tensor_type)),
-            ..Default::default()
+            denotation: String::new(),
         };
 
         let vi = crate::protos::onnx::ValueInfoProto {
             name: "input".to_string(),
-            r#type: Some(type_proto).into(),
+            r#type: Some(type_proto),
             ..Default::default()
         };
 
@@ -1093,7 +1091,7 @@ mod tests {
         };
 
         let model = crate::protos::onnx::ModelProto {
-            graph: Some(graph).into(),
+            graph: Some(graph),
             ..Default::default()
         };
 
@@ -1112,27 +1110,25 @@ mod tests {
             value: Some(tensor_shape_proto::dimension::Value::DimParam(
                 "batch".to_string(),
             )),
-            ..Default::default()
+            denotation: String::new(),
         };
         let shape = crate::protos::onnx::TensorShapeProto {
             dim: vec![dim],
-            ..Default::default()
         };
 
         let tensor_type = type_proto::Tensor {
             elem_type: crate::protos::onnx::TensorProto_DataType::Float.into(),
-            shape: Some(shape).into(),
-            ..Default::default()
+            shape: Some(shape),
         };
 
         let type_proto = crate::protos::onnx::TypeProto {
             value: Some(type_proto::Value::TensorType(tensor_type)),
-            ..Default::default()
+            denotation: String::new(),
         };
 
         let vi = crate::protos::onnx::ValueInfoProto {
             name: "input".to_string(),
-            r#type: Some(type_proto).into(),
+            r#type: Some(type_proto),
             ..Default::default()
         };
 
@@ -1142,7 +1138,7 @@ mod tests {
         };
 
         let model = crate::protos::onnx::ModelProto {
-            graph: Some(graph).into(),
+            graph: Some(graph),
             ..Default::default()
         };
 

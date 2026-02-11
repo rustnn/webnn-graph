@@ -73,7 +73,7 @@ mod tests {
 
         let value_attr = AttributeProto {
             name: "value".to_string(),
-            t: Some(tensor).into(),
+            t: Some(tensor),
             ..Default::default()
         };
 
@@ -118,7 +118,7 @@ mod tests {
 
         let value_attr = AttributeProto {
             name: "value".to_string(),
-            t: Some(tensor).into(),
+            t: Some(tensor),
             ..Default::default()
         };
 
