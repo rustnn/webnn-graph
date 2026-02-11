@@ -15,7 +15,7 @@ pub fn emit_html(graph: &GraphJson) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ast::{new_graph_json, DataType, OperandDesc};
+    use crate::ast::{new_graph_json, to_dimension_vector, DataType, OperandDesc};
 
     #[test]
     fn test_emit_html_basic_graph() {
@@ -25,7 +25,7 @@ mod tests {
             "x".to_string(),
             OperandDesc {
                 data_type: DataType::Float32,
-                shape: vec![1, 10],
+                shape: to_dimension_vector(&[1, 10]),
             },
         );
 

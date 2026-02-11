@@ -614,6 +614,28 @@
       return graph;
     }
 
+    function formatDim(dim) {
+      if (typeof dim === 'number') {
+        return dim.toString();
+      }
+      if (dim && typeof dim === 'object') {
+        const name = dim.name || '?';
+        const maxSize = dim.maxSize;
+        if (maxSize === undefined || maxSize === null) {
+          return name;
+        }
+        return `${name}(maxSize:${maxSize})`;
+      }
+      return String(dim);
+    }
+
+    function formatShape(shape) {
+      if (!Array.isArray(shape)) {
+        return '';
+      }
+      return shape.map(formatDim).join(', ');
+    }
+
     // ============================================================================
     // FileLoader: Handle drag-and-drop and file input
     // ============================================================================
@@ -1030,7 +1052,7 @@
             <div class="detail-section">
               <h3>Input</h3>
               <p><strong>Type:</strong> <span class="type-badge">${node.dataType}</span></p>
-              <p><strong>Shape:</strong> <span class="shape-badge">[${node.shape.join(', ')}]</span></p>
+              <p><strong>Shape:</strong> <span class="shape-badge">[${formatShape(node.shape)}]</span></p>
             </div>
           `;
         } else if (node.type === 'const') {
@@ -1038,7 +1060,7 @@
             <div class="detail-section">
               <h3>Constant</h3>
               <p><strong>Type:</strong> <span class="type-badge">${node.dataType}</span></p>
-              <p><strong>Shape:</strong> <span class="shape-badge">[${node.shape.join(', ')}]</span></p>
+              <p><strong>Shape:</strong> <span class="shape-badge">[${formatShape(node.shape)}]</span></p>
               <p><strong>Init:</strong></p>
               <pre>${JSON.stringify(node.init, null, 2)}</pre>
             </div>

@@ -1,6 +1,6 @@
 // Main ONNX to WebNN conversion logic
 
-use crate::ast::{DataType, GraphJson};
+use crate::ast::{to_dimension_vector, DataType, GraphJson};
 use crate::protos::onnx::{
     tensor_shape_proto::dimension::Value as DimensionValue, type_proto::Value as TypeProtoValue,
     ModelProto, TensorProto, TensorProto_DataType,
@@ -781,7 +781,7 @@ impl OnnxConverter {
                         name.clone(),
                         crate::ast::OperandDesc {
                             data_type: data_type.clone(),
-                            shape,
+                            shape: to_dimension_vector(&shape),
                         },
                     );
 

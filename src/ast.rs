@@ -1,6 +1,31 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "camelCase")]
+pub struct DynamicDimension {
+    pub name: String,
+    pub max_size: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(untagged)]
+pub enum Dimension {
+    Static(u32),
+    Dynamic(DynamicDimension),
+}
+
+pub fn to_dimension_vector(shape: &[u32]) -> Vec<Dimension> {
+    shape.iter().copied().map(Dimension::Static).collect()
+}
+
+pub fn get_static_or_max_size(dim: &Dimension) -> u32 {
+    match dim {
+        Dimension::Static(v) => *v,
+        Dimension::Dynamic(d) => d.max_size,
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GraphJson {
     pub format: String, // "webnn-graph-json"
@@ -21,7 +46,7 @@ pub struct GraphJson {
 pub struct OperandDesc {
     #[serde(rename = "dataType")]
     pub data_type: DataType,
-    pub shape: Vec<u32>,
+    pub shape: Vec<Dimension>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -121,6 +146,19 @@ pub fn new_graph_json() -> GraphJson {
     }
 }
 
+impl OperandDesc {
+    pub fn static_shape(&self) -> Option<Vec<u32>> {
+        let mut shape = Vec::with_capacity(self.shape.len());
+        for dim in &self.shape {
+            match dim {
+                Dimension::Static(v) => shape.push(*v),
+                Dimension::Dynamic(_) => return None,
+            }
+        }
+        Some(shape)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -154,15 +192,15 @@ mod tests {
     fn test_operand_desc_equality() {
         let desc1 = OperandDesc {
             data_type: DataType::Float32,
-            shape: vec![1, 2, 3],
+            shape: to_dimension_vector(&[1, 2, 3]),
         };
         let desc2 = OperandDesc {
             data_type: DataType::Float32,
-            shape: vec![1, 2, 3],
+            shape: to_dimension_vector(&[1, 2, 3]),
         };
         let desc3 = OperandDesc {
             data_type: DataType::Float16,
-            shape: vec![1, 2, 3],
+            shape: to_dimension_vector(&[1, 2, 3]),
         };
         assert_eq!(desc1, desc2);
         assert_ne!(desc1, desc3);

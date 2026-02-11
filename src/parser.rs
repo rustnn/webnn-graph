@@ -1,4 +1,7 @@
-use crate::ast::{new_graph_json, ConstDecl, ConstInit, DataType, GraphJson, Node, OperandDesc};
+use crate::ast::{
+    new_graph_json, to_dimension_vector, ConstDecl, ConstInit, DataType, GraphJson, Node,
+    OperandDesc,
+};
 use pest::iterators::Pair;
 use pest::Parser;
 use pest_derive::Parser;
@@ -81,7 +84,7 @@ fn parse_inputs_block(
                 name,
                 OperandDesc {
                     data_type: dt,
-                    shape,
+                    shape: to_dimension_vector(&shape),
                 },
             );
         }
@@ -451,11 +454,11 @@ webnn_graph "test" v1 {
 
         let x_desc = &graph.inputs["x"];
         assert_eq!(x_desc.data_type, DataType::Float32);
-        assert_eq!(x_desc.shape, vec![1, 10]);
+        assert_eq!(x_desc.shape, to_dimension_vector(&[1, 10]));
 
         let y_desc = &graph.inputs["y"];
         assert_eq!(y_desc.data_type, DataType::Int32);
-        assert_eq!(y_desc.shape, vec![5]);
+        assert_eq!(y_desc.shape, to_dimension_vector(&[5]));
     }
 
     #[test]

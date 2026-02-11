@@ -1,4 +1,4 @@
-use crate::ast::{DataType, GraphJson};
+use crate::ast::{DataType, Dimension, GraphJson};
 
 fn dt_to_js(dt: &DataType) -> &'static str {
     match dt {
@@ -13,6 +13,18 @@ fn dt_to_js(dt: &DataType) -> &'static str {
         DataType::Int8 => "int8",
         DataType::Uint8 => "uint8",
     }
+}
+
+fn dim_to_js(dim: &Dimension) -> String {
+    match dim {
+        Dimension::Static(v) => v.to_string(),
+        Dimension::Dynamic(d) => format!("{{ name: {:?}, maxSize: {} }}", d.name, d.max_size),
+    }
+}
+
+fn shape_to_js(shape: &[Dimension]) -> String {
+    let dims: Vec<String> = shape.iter().map(dim_to_js).collect();
+    format!("[{}]", dims.join(", "))
 }
 
 /// Emit the WeightsFile helper class for loading weights
@@ -117,7 +129,7 @@ pub fn emit_builder_js(g: &GraphJson) -> String {
     s.push_str("  const env = new Map();\n\n");
 
     for (name, d) in &g.inputs {
-        let shape = format!("{:?}", d.shape);
+        let shape = shape_to_js(&d.shape);
         s.push_str(&format!(
             "  env.set({name:?}, builder.input({name:?}, {{ dataType: {dt:?}, shape: {shape} }}));\n",
             name = name,
@@ -207,7 +219,9 @@ pub fn emit_builder_js(g: &GraphJson) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ast::{new_graph_json, ConstDecl, ConstInit, DataType, Node, OperandDesc};
+    use crate::ast::{
+        new_graph_json, to_dimension_vector, ConstDecl, ConstInit, DataType, Node, OperandDesc,
+    };
 
     #[test]
     fn test_dt_to_js() {
@@ -230,7 +244,7 @@ mod tests {
             "x".to_string(),
             OperandDesc {
                 data_type: DataType::Float32,
-                shape: vec![1, 10],
+                shape: to_dimension_vector(&[1, 10]),
             },
         );
         g.nodes.push(Node {
@@ -259,7 +273,7 @@ mod tests {
             "x".to_string(),
             OperandDesc {
                 data_type: DataType::Float32,
-                shape: vec![1, 10],
+                shape: to_dimension_vector(&[1, 10]),
             },
         );
         g.consts.insert(
@@ -296,7 +310,7 @@ mod tests {
             "x".to_string(),
             OperandDesc {
                 data_type: DataType::Float32,
-                shape: vec![1],
+                shape: to_dimension_vector(&[1]),
             },
         );
         g.consts.insert(
@@ -348,7 +362,7 @@ mod tests {
             "x".to_string(),
             OperandDesc {
                 data_type: DataType::Float32,
-                shape: vec![1, 10],
+                shape: to_dimension_vector(&[1, 10]),
             },
         );
 
@@ -376,7 +390,7 @@ mod tests {
             "x".to_string(),
             OperandDesc {
                 data_type: DataType::Float32,
-                shape: vec![10],
+                shape: to_dimension_vector(&[10]),
             },
         );
         g.nodes.push(Node {
@@ -402,14 +416,14 @@ mod tests {
             "x".to_string(),
             OperandDesc {
                 data_type: DataType::Float32,
-                shape: vec![1],
+                shape: to_dimension_vector(&[1]),
             },
         );
         g.inputs.insert(
             "y".to_string(),
             OperandDesc {
                 data_type: DataType::Float32,
-                shape: vec![1],
+                shape: to_dimension_vector(&[1]),
             },
         );
         g.nodes.push(Node {

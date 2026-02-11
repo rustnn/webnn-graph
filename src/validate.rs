@@ -110,7 +110,7 @@ pub fn validate_weights(g: &GraphJson, m: &WeightsManifest) -> Result<(), Valida
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ast::{new_graph_json, ConstDecl, DataType, Node, OperandDesc};
+    use crate::ast::{new_graph_json, to_dimension_vector, ConstDecl, DataType, Node, OperandDesc};
     use crate::weights::TensorEntry;
     use std::collections::BTreeMap;
 
@@ -121,7 +121,7 @@ mod tests {
             "x".to_string(),
             OperandDesc {
                 data_type: DataType::Float32,
-                shape: vec![1, 10],
+                shape: to_dimension_vector(&[1, 10]),
             },
         );
         g.nodes.push(Node {
@@ -160,7 +160,7 @@ mod tests {
             "x".to_string(),
             OperandDesc {
                 data_type: DataType::Float32,
-                shape: vec![1],
+                shape: to_dimension_vector(&[1]),
             },
         );
         g.nodes.push(Node {
@@ -190,7 +190,7 @@ mod tests {
             "x".to_string(),
             OperandDesc {
                 data_type: DataType::Float32,
-                shape: vec![1],
+                shape: to_dimension_vector(&[1]),
             },
         );
         g.nodes.push(Node {
@@ -213,7 +213,7 @@ mod tests {
             "x".to_string(),
             OperandDesc {
                 data_type: DataType::Float32,
-                shape: vec![1],
+                shape: to_dimension_vector(&[1]),
             },
         );
         g.outputs

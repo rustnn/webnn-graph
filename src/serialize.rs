@@ -1,4 +1,4 @@
-use crate::ast::{ConstInit, GraphJson, Node};
+use crate::ast::{ConstInit, Dimension, GraphJson, Node};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -51,7 +51,7 @@ pub fn serialize_graph_to_wg_text(
         output.push_str("  inputs {\n");
         for (name, desc) in &graph.inputs {
             let dtype = desc.data_type.to_wg_text();
-            let shape = serialize_shape(&desc.shape);
+            let shape = serialize_shape(&desc.shape)?;
             output.push_str(&format!("    {}: {}{};\n", name, dtype, shape));
         }
         output.push_str("  }\n\n");
@@ -62,7 +62,7 @@ pub fn serialize_graph_to_wg_text(
         output.push_str("  consts {\n");
         for (name, const_decl) in &graph.consts {
             let dtype = const_decl.data_type.to_wg_text();
-            let shape = serialize_shape(&const_decl.shape);
+            let shape = serialize_shape_u32(&const_decl.shape);
             let annotation = serialize_const_init(&const_decl.init);
             output.push_str(&format!("    {}: {}{}{}", name, dtype, shape, annotation));
             output.push_str(";\n");
@@ -92,7 +92,23 @@ pub fn serialize_graph_to_wg_text(
     Ok(output)
 }
 
-fn serialize_shape(shape: &[u32]) -> String {
+fn serialize_shape(shape: &[Dimension]) -> Result<String, SerializeError> {
+    let mut dims: Vec<String> = Vec::with_capacity(shape.len());
+    for dim in shape {
+        match dim {
+            Dimension::Static(v) => dims.push(v.to_string()),
+            Dimension::Dynamic(d) => {
+                return Err(SerializeError::InvalidFormat(format!(
+                    "dynamic dimension '{}' is not supported in wg text format",
+                    d.name
+                )));
+            }
+        }
+    }
+    Ok(format!("[{}]", dims.join(", ")))
+}
+
+fn serialize_shape_u32(shape: &[u32]) -> String {
     let dims: Vec<String> = shape.iter().map(|d| d.to_string()).collect();
     format!("[{}]", dims.join(", "))
 }
@@ -169,7 +185,9 @@ fn escape_string(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ast::{new_graph_json, ConstDecl, ConstInit, DataType, Node, OperandDesc};
+    use crate::ast::{
+        new_graph_json, to_dimension_vector, ConstDecl, ConstInit, DataType, Node, OperandDesc,
+    };
     use crate::parser::parse_wg_text;
 
     #[test]
@@ -180,7 +198,7 @@ mod tests {
             "x".to_string(),
             OperandDesc {
                 data_type: DataType::Float32,
-                shape: vec![1, 10],
+                shape: to_dimension_vector(&[1, 10]),
             },
         );
         g.nodes.push(Node {
@@ -249,7 +267,7 @@ mod tests {
             "x".to_string(),
             OperandDesc {
                 data_type: DataType::Float32,
-                shape: vec![10],
+                shape: to_dimension_vector(&[10]),
             },
         );
         g.nodes.push(Node {
@@ -273,7 +291,7 @@ mod tests {
             "x".to_string(),
             OperandDesc {
                 data_type: DataType::Float32,
-                shape: vec![1, 10],
+                shape: to_dimension_vector(&[1, 10]),
             },
         );
 
@@ -317,7 +335,7 @@ mod tests {
                 name.to_string(),
                 OperandDesc {
                     data_type: dtype,
-                    shape: vec![1],
+                    shape: to_dimension_vector(&[1]),
                 },
             );
         }
@@ -402,7 +420,7 @@ webnn_graph "resnet_head" v1 {
             "x".to_string(),
             OperandDesc {
                 data_type: DataType::Float32,
-                shape: vec![1],
+                shape: to_dimension_vector(&[1]),
             },
         );
 
