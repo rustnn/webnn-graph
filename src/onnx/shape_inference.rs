@@ -1065,9 +1065,7 @@ mod tests {
             )),
             denotation: String::new(),
         };
-        let shape = crate::protos::onnx::TensorShapeProto {
-            dim: vec![dim],
-        };
+        let shape = crate::protos::onnx::TensorShapeProto { dim: vec![dim] };
 
         let tensor_type = type_proto::Tensor {
             elem_type: crate::protos::onnx::TensorProto_DataType::Float.into(),
@@ -1112,9 +1110,7 @@ mod tests {
             )),
             denotation: String::new(),
         };
-        let shape = crate::protos::onnx::TensorShapeProto {
-            dim: vec![dim],
-        };
+        let shape = crate::protos::onnx::TensorShapeProto { dim: vec![dim] };
 
         let tensor_type = type_proto::Tensor {
             elem_type: crate::protos::onnx::TensorProto_DataType::Float.into(),
