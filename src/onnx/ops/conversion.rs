@@ -116,21 +116,21 @@ impl ConversionHandler {
         };
 
         // Extract 'value' attribute (TensorProto)
-        let mut value_tensor = None;
-        for attr in node.attribute.as_slice() {
-            if attr.name.as_str() == "value" && attr.t.is_some() {
-                value_tensor = Some(attr.t.as_ref().unwrap());
-            }
-        }
-
-        if value_tensor.is_none() {
-            return Err(OnnxError::MissingAttribute {
+        let tensor = node
+            .attribute
+            .as_slice()
+            .iter()
+            .find_map(|attr| {
+                if attr.name.as_str() == "value" {
+                    attr.t.as_ref()
+                } else {
+                    None
+                }
+            })
+            .ok_or_else(|| OnnxError::MissingAttribute {
                 attr: "value".to_string(),
                 op: "Constant".to_string(),
-            });
-        }
-
-        let tensor = value_tensor.unwrap();
+            })?;
         let onnx_type = tensor.data_type;
         let data_type = crate::onnx::convert::map_onnx_data_type(onnx_type)?;
 

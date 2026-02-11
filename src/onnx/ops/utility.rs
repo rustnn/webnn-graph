@@ -316,9 +316,9 @@ impl UtilityHandler {
         let mut fill_value_i64: i64 = 0;
         let mut dtype = DataType::Int64;
         for attr in node.attribute.as_slice() {
-            if attr.name.as_str() == "value" && attr.t.is_some() {
-                let t = attr.t.as_ref().unwrap();
-                match t.data_type {
+            if attr.name.as_str() == "value" {
+                if let Some(t) = attr.t.as_ref() {
+                    match t.data_type {
                     // FLOAT
                     x if x == crate::protos::onnx::TensorProto_DataType::Float as i32 => {
                         dtype = DataType::Float32;
@@ -349,6 +349,7 @@ impl UtilityHandler {
                         }
                     }
                     _ => {}
+                    }
                 }
             }
         }

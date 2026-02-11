@@ -65,9 +65,9 @@ impl EvaluatorTrait for ConstantOfShapeEvaluator {
         let mut data_type = TensorProto_DataType::Float as i32;
 
         for attr in node.attribute.as_slice() {
-            if attr.name.as_str() == "value" && attr.t.is_some() {
-                let value_tensor = attr.t.as_ref().unwrap();
-                data_type = value_tensor.data_type;
+            if attr.name.as_str() == "value" {
+                if let Some(value_tensor) = attr.t.as_ref() {
+                    data_type = value_tensor.data_type;
 
                 match data_type {
                     x if x == TensorProto_DataType::Int64 as i32 => {
@@ -94,6 +94,7 @@ impl EvaluatorTrait for ConstantOfShapeEvaluator {
                             data_type
                         )))
                     }
+                }
                 }
             }
         }

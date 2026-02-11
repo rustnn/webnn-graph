@@ -1438,9 +1438,9 @@ impl OnnxConverter {
                             // Get the fill value from attributes (default is 0)
                             let mut fill_value = 0i64;
                             for attr in node.attribute.as_slice() {
-                                if attr.name.as_str() == "value" && attr.t.is_some() {
-                                    let value_tensor = attr.t.as_ref().unwrap();
-                                    if value_tensor.data_type
+                                if attr.name.as_str() == "value" {
+                                    if let Some(value_tensor) = attr.t.as_ref() {
+                                        if value_tensor.data_type
                                         == crate::protos::onnx::TensorProto_DataType::Int64 as i32
                                     {
                                         let raw = value_tensor.raw_data.as_slice();
@@ -1451,6 +1451,7 @@ impl OnnxConverter {
                                             ]);
                                         } else if !value_tensor.int64_data.as_slice().is_empty() {
                                             fill_value = value_tensor.int64_data.as_slice()[0];
+                                        }
                                         }
                                     }
                                 }
