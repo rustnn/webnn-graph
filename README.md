@@ -12,6 +12,16 @@ allows for interactive exploration of graph structure.
 
 Check it out at [https://blog.ziade.org/webnn-graph](https://blog.ziade.org/webnn-graph)
 
+## Development
+
+### Git Hooks (Recommended)
+
+Enable pre-commit hooks to run clippy locally:
+
+```bash
+./scripts/setup-githooks.sh
+```
+
 ## Conceptual Model
 
 A WebNN graph defined with this project is split across **three distinct files**, each with a single responsibility.
