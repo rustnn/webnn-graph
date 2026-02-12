@@ -415,6 +415,31 @@ fn parse_value(p: Pair<Rule>) -> Result<Value, ParseError> {
             }
             Ok(Value::Array(arr))
         }
+        Rule::object => {
+            let mut map = serde_json::Map::new();
+            for inner in p.into_inner() {
+                if inner.as_rule() == Rule::object_item {
+                    let mut it = inner.into_inner();
+                    let key_pair = it
+                        .next()
+                        .ok_or_else(|| ParseError::Internal("object key missing".into()))?;
+                    let key = match key_pair.as_rule() {
+                        Rule::string => unquote(key_pair.as_str()),
+                        Rule::ident => key_pair.as_str().to_string(),
+                        _ => {
+                            return Err(ParseError::Internal(
+                                "unexpected object key rule".to_string(),
+                            ));
+                        }
+                    };
+                    let value_pair = it
+                        .next()
+                        .ok_or_else(|| ParseError::Internal("object value missing".into()))?;
+                    map.insert(key, parse_value(value_pair)?);
+                }
+            }
+            Ok(Value::Object(map))
+        }
         Rule::ident => Ok(Value::String(p.as_str().to_string())),
         _ => Err(ParseError::Internal(format!(
             "unexpected value rule: {:?}",

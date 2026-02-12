@@ -158,6 +158,7 @@ mod tests {
             ConversionContext {
                 initializers: &self.initializers,
                 value_shapes: &self.value_shapes,
+                value_shape_dims: crate::onnx::ops::empty_value_shape_dims(),
                 const_values: &self.const_values,
                 value_ids: &self.value_ids,
                 value_types: &self.value_types,

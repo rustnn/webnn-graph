@@ -687,19 +687,8 @@ impl OnnxConverter {
             .collect();
 
         let default_dynamic_max_size: u32 = 65_535;
-        let default_inference_dim_values: HashMap<&str, u32> = HashMap::from([
-            ("batch_size", 1),
-            ("batch", 1),
-            ("n", 1),
-            ("b", 1),
-            ("sequence_length", 128),
-            ("seq_len", 128),
-            ("seq", 128),
-            ("s", 128),
-            ("t", 128),
-            ("past_sequence_length", 64),
-            ("past_sequence_length + 1", 65),
-        ]);
+        let default_inference_dim_values: HashMap<&str, u32> =
+            HashMap::from([("batch_size", 1), ("batch", 1), ("n", 1), ("b", 1)]);
         let dynamic_max_for_dim = |name: &str| -> u32 {
             let lower = name.to_ascii_lowercase();
             if lower.contains("past")
@@ -898,6 +887,7 @@ impl OnnxConverter {
 
         // Build value_shapes map from value_info and inputs for shape inference
         let mut value_shapes = std::collections::HashMap::new();
+        let mut value_shape_dims = std::collections::HashMap::new();
 
         // Add input shapes (already validated)
         for (raw_name, mapped_name) in value_name_map.clone() {
@@ -935,6 +925,30 @@ impl OnnxConverter {
                                 value_shapes.insert(raw_name.clone(), shape.clone());
                                 value_shapes.insert(mapped_name.clone(), shape);
                             }
+                            let mut dims = Vec::new();
+                            for dim in &shape_proto.dim {
+                                if let Some(dim_value) = &dim.value {
+                                    match dim_value {
+                                        DimensionValue::DimValue(v) => {
+                                            if *v > 0 {
+                                                dims.push(crate::ast::Dimension::Static(*v as u32));
+                                            }
+                                        }
+                                        DimensionValue::DimParam(dim_param) => {
+                                            dims.push(crate::ast::Dimension::Dynamic(
+                                                crate::ast::DynamicDimension {
+                                                    name: dim_param.clone(),
+                                                    max_size: dynamic_max_for_dim(dim_param),
+                                                },
+                                            ));
+                                        }
+                                    }
+                                }
+                            }
+                            if !dims.is_empty() {
+                                value_shape_dims.insert(raw_name.clone(), dims.clone());
+                                value_shape_dims.insert(mapped_name.clone(), dims);
+                            }
                         }
                     }
                 }
@@ -955,6 +969,16 @@ impl OnnxConverter {
             }
             let shape: Vec<i64> = initializer.dims.as_slice().to_vec();
             value_shapes.insert(initializer.name.as_str().to_string(), shape);
+            let dims: Vec<crate::ast::Dimension> = initializer
+                .dims
+                .iter()
+                .copied()
+                .filter(|d| *d > 0)
+                .map(|d| crate::ast::Dimension::Static(d as u32))
+                .collect();
+            if !dims.is_empty() {
+                value_shape_dims.insert(initializer.name.as_str().to_string(), dims);
+            }
         }
 
         // Add value_info shapes (intermediate tensors from shape inference)
@@ -992,6 +1016,29 @@ impl OnnxConverter {
 
                         if !unknown && !shape.is_empty() && shape.iter().all(|&d| d > 0) {
                             value_shapes.insert(value_info.name.as_str().to_string(), shape);
+                        }
+                        let mut dims = Vec::new();
+                        for dim in &shape_proto.dim {
+                            if let Some(dim_value) = &dim.value {
+                                match dim_value {
+                                    DimensionValue::DimValue(v) => {
+                                        if *v > 0 {
+                                            dims.push(crate::ast::Dimension::Static(*v as u32));
+                                        }
+                                    }
+                                    DimensionValue::DimParam(dim_param) => {
+                                        dims.push(crate::ast::Dimension::Dynamic(
+                                            crate::ast::DynamicDimension {
+                                                name: dim_param.clone(),
+                                                max_size: dynamic_max_for_dim(dim_param),
+                                            },
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                        if !dims.is_empty() {
+                            value_shape_dims.insert(value_info.name.as_str().to_string(), dims);
                         }
                     }
                 }
@@ -1544,89 +1591,9 @@ impl OnnxConverter {
                         }
                     }
                 } else if op_type == "Where" {
-                    // Where(condition, x, y) -> select x where condition is true, y otherwise
-                    if node.input.as_slice().len() >= 3 {
-                        let out_name = node.output.as_slice().first().map(|s| s.as_str());
-
-                        // Skip if already computed by shape inference (to preserve smart heuristics)
-                        if let Some(out) = out_name {
-                            if const_values.contains_key(out) {
-                                continue;
-                            }
-                        }
-
-                        if let (Some(cond), Some(x), Some(y), Some(out)) = (
-                            node.input
-                                .as_slice()
-                                .first()
-                                .and_then(|i| const_values.get(i)),
-                            node.input
-                                .as_slice()
-                                .get(1)
-                                .and_then(|i| const_values.get(i)),
-                            node.input
-                                .as_slice()
-                                .get(2)
-                                .and_then(|i| const_values.get(i)),
-                            node.output.as_slice().first(),
-                        ) {
-                            // HEURISTIC: Apply smart Where evaluation like in shape_inference.rs
-                            // If one branch is trivial (all 1s, ≤3 elements) and the other is not,
-                            // prefer the non-trivial branch regardless of condition
-                            let is_trivial = |vals: &[i64]| -> bool {
-                                vals.iter().all(|&v| v == 1) && vals.len() <= 3
-                            };
-
-                            let result_vals = if is_trivial(x) && !is_trivial(y) {
-                                if out.contains("rotary") {
-                                    crate::debug_println!("[PROP WHERE] Preferring non-trivial y={:?} over trivial x={:?}", y, x);
-                                }
-                                y.clone()
-                            } else if is_trivial(y) && !is_trivial(x) {
-                                if out.contains("rotary") {
-                                    crate::debug_println!("[PROP WHERE] Preferring non-trivial x={:?} over trivial y={:?}", x, y);
-                                }
-                                x.clone()
-                            } else {
-                                // Normal element-wise evaluation
-                                let mut vals = Vec::new();
-                                let (cond_len, x_len, y_len) = (cond.len(), x.len(), y.len());
-                                let max_len = cond_len.max(x_len).max(y_len);
-                                for idx in 0..max_len {
-                                    let cond_v = if cond_len == 1 {
-                                        cond[0]
-                                    } else {
-                                        cond.get(idx).copied().unwrap_or(0)
-                                    };
-                                    let x_v = if x_len == 1 {
-                                        x[0]
-                                    } else {
-                                        x.get(idx).copied().unwrap_or(0)
-                                    };
-                                    let y_v = if y_len == 1 {
-                                        y[0]
-                                    } else {
-                                        y.get(idx).copied().unwrap_or(0)
-                                    };
-                                    vals.push(if cond_v != 0 { x_v } else { y_v });
-                                }
-                                vals
-                            };
-
-                            if !result_vals.is_empty() {
-                                const_values.insert(out.to_string(), result_vals.clone());
-                                let out_shape = if result_vals.len() == 1 {
-                                    Vec::new()
-                                } else {
-                                    vec![result_vals.len() as i64]
-                                };
-                                // Force the correct shape - Where operation computes exact output shape
-                                value_shapes.insert(out.to_string(), out_shape.clone());
-                                value_shapes.insert(sanitize_identifier(out), out_shape);
-                                value_types.insert(out.to_string(), DataType::Int64);
-                            }
-                        }
-                    }
+                    // Keep Where dynamic to avoid baking shape-driving expressions
+                    // (e.g., past_sequence_length + 1) into fixed constants.
+                    continue;
                 }
             }
 
@@ -1709,10 +1676,19 @@ impl OnnxConverter {
                 for out in outputs {
                     if let Some(values) = const_values.get(out) {
                         let const_name = sanitize_identifier(out);
-                        let shape = value_shapes
+                        let mut shape = value_shapes
                             .get(out.as_str())
                             .cloned()
                             .unwrap_or_else(|| vec![values.len() as i64]);
+                        let declared_numel = shape
+                            .iter()
+                            .try_fold(1usize, |acc, d| usize::try_from(*d).ok().map(|v| acc * v));
+                        if declared_numel != Some(values.len()) {
+                            // Some folded constants are broadcast candidates where value_shapes
+                            // carries the post-broadcast shape but const_values stores the compact payload.
+                            // Keep shape/data internally consistent by using the compact shape.
+                            shape = vec![values.len() as i64];
+                        }
                         let dtype = value_types
                             .get(out.as_str())
                             .cloned()
@@ -1747,6 +1723,7 @@ impl OnnxConverter {
             let context = crate::onnx::ops::ConversionContext {
                 initializers: &initializers_map,
                 value_shapes: &value_shapes,
+                value_shape_dims: &value_shape_dims,
                 const_values: &const_values,
                 value_ids: &value_name_map,
                 value_types: &value_types,
@@ -1754,7 +1731,32 @@ impl OnnxConverter {
 
             let converted = registry.convert_node(onnx_node, &context)?;
 
-            for (name, decl) in converted.consts {
+            for (name, mut decl) in converted.consts {
+                if let crate::ast::ConstInit::InlineBytes { bytes } = &decl.init {
+                    let elem_size = match decl.data_type {
+                        DataType::Float32 => 4,
+                        DataType::Float16 => 2,
+                        DataType::Int64 => 8,
+                        DataType::Uint64 => 8,
+                        DataType::Int32 => 4,
+                        DataType::Uint32 => 4,
+                        DataType::Int8 => 1,
+                        DataType::Uint8 => 1,
+                        DataType::Int4 | DataType::Uint4 => 0,
+                    };
+                    if elem_size > 0 {
+                        let declared_numel = decl
+                            .shape
+                            .iter()
+                            .try_fold(1usize, |acc, d| usize::try_from(*d).ok().map(|v| acc * v));
+                        let declared_bytes = declared_numel.map(|n| n * elem_size);
+                        if declared_bytes != Some(bytes.len()) && bytes.len() % elem_size == 0 {
+                            // Keep const metadata internally consistent even when upstream shape
+                            // metadata reflects a broadcasted view of compact inline data.
+                            decl.shape = vec![(bytes.len() / elem_size) as u32];
+                        }
+                    }
+                }
                 let decl_dtype = decl.data_type.clone();
                 if let Some(existing) = self.graph.consts.get(&name) {
                     if existing != &decl {

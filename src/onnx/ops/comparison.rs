@@ -124,6 +124,7 @@ mod tests {
         let context = ConversionContext {
             initializers: &initializers,
             value_shapes: &value_shapes,
+            value_shape_dims: crate::onnx::ops::empty_value_shape_dims(),
             const_values: &const_values,
             value_ids: &value_ids,
             value_types: &value_types,
@@ -154,6 +155,7 @@ mod tests {
         let context = ConversionContext {
             initializers: &initializers,
             value_shapes: &value_shapes,
+            value_shape_dims: crate::onnx::ops::empty_value_shape_dims(),
             const_values: &const_values,
             value_ids: &value_ids,
             value_types: &value_types,
@@ -177,6 +179,7 @@ mod tests {
         let context = ConversionContext {
             initializers: &initializers,
             value_shapes: &value_shapes,
+            value_shape_dims: crate::onnx::ops::empty_value_shape_dims(),
             const_values: &const_values,
             value_ids: &value_ids,
             value_types: &value_types,
@@ -200,6 +203,7 @@ mod tests {
         let context = ConversionContext {
             initializers: &initializers,
             value_shapes: &value_shapes,
+            value_shape_dims: crate::onnx::ops::empty_value_shape_dims(),
             const_values: &const_values,
             value_ids: &value_ids,
             value_types: &value_types,
@@ -223,6 +227,7 @@ mod tests {
         let context = ConversionContext {
             initializers: &initializers,
             value_shapes: &value_shapes,
+            value_shape_dims: crate::onnx::ops::empty_value_shape_dims(),
             const_values: &const_values,
             value_ids: &value_ids,
             value_types: &value_types,
@@ -246,6 +251,7 @@ mod tests {
         let context = ConversionContext {
             initializers: &initializers,
             value_shapes: &value_shapes,
+            value_shape_dims: crate::onnx::ops::empty_value_shape_dims(),
             const_values: &const_values,
             value_ids: &value_ids,
             value_types: &value_types,

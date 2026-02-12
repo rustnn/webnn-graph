@@ -221,9 +221,54 @@ impl ReshapeHandler {
                     );
                 }
             } else {
+                let output_dims_opt = node
+                    .output
+                    .as_slice()
+                    .first()
+                    .and_then(|out| {
+                        let out_s = out.to_string();
+                        context
+                            .value_shape_dims
+                            .get(&out_s)
+                            .or_else(|| context.value_shape_dims.get(&sanitize_identifier(&out_s)))
+                            .or_else(|| context.value_shape_dims.get(out_s.trim_start_matches('/')))
+                    })
+                    .cloned();
+                if let Some(output_dims) = output_dims_opt {
+                    let new_shape_json: Vec<serde_json::Value> = output_dims
+                        .into_iter()
+                        .map(|d| match d {
+                            crate::ast::Dimension::Static(v) => serde_json::json!(v),
+                            crate::ast::Dimension::Dynamic(dd) => serde_json::json!({
+                                "name": dd.name,
+                                "maxSize": dd.max_size
+                            }),
+                        })
+                        .collect();
+                    if !new_shape_json.is_empty() {
+                        let mut options = Map::new();
+                        options.insert("newShape".to_string(), serde_json::json!(new_shape_json));
+
+                        let mut result = ConversionResult::new(vec![Node {
+                            id: output_name.clone(),
+                            op: "reshape".to_string(),
+                            inputs: vec![data_input],
+                            options,
+                            outputs: None,
+                        }]);
+
+                        if let Some(output) = node.output.as_slice().first() {
+                            result
+                                .output_mappings
+                                .insert(output.to_string(), output_name.clone());
+                        }
+
+                        return Ok(result);
+                    }
+                }
+
                 return Err(OnnxError::InvalidShape(format!(
-                    "Reshape shape input '{}' must be a constant (initializer/constant-folded) or input shape must be known. \
-                WebNN requires static newShape. Please ensure onnx-simplifier fully resolved all shapes.",
+                    "Reshape shape input '{}' must be a constant (initializer/constant-folded) or input shape must be known.",
                     shape_input_raw
                 )));
             }
@@ -515,7 +560,21 @@ impl ReshapeHandler {
             Vec::new()
         };
 
+        let mut dynamic_shape_json: Option<Vec<serde_json::Value>> = None;
         let shape_values: Vec<i64> = if shape_values.is_empty() {
+            let output_dim_shape = node
+                .output
+                .as_slice()
+                .first()
+                .and_then(|out| {
+                    let out_s = out.to_string();
+                    context
+                        .value_shape_dims
+                        .get(&out_s)
+                        .or_else(|| context.value_shape_dims.get(&sanitize_identifier(&out_s)))
+                        .or_else(|| context.value_shape_dims.get(out_s.trim_start_matches('/')))
+                })
+                .cloned();
             let output_shape_opt = node
                 .output
                 .as_slice()
@@ -531,7 +590,11 @@ impl ReshapeHandler {
                 .cloned();
 
             if let Some(output_shape) = output_shape_opt {
-                if output_shape.iter().all(|&d| d > 0) {
+                let has_dynamic_output_dim = output_dim_shape.as_ref().is_some_and(|dims| {
+                    dims.iter()
+                        .any(|d| matches!(d, crate::ast::Dimension::Dynamic(_)))
+                });
+                if output_shape.iter().all(|&d| d > 0) && !has_dynamic_output_dim {
                     crate::debug_println!(
                         "[expand] using inferred output shape for {}: {:?}",
                         node_name,
@@ -539,25 +602,52 @@ impl ReshapeHandler {
                     );
                     output_shape
                 } else {
-                    return Err(OnnxError::InvalidShape(format!(
-                        "Expand shape input {} is dynamic and inferred output shape {:?} is not fully static. Consider using --override-dim.",
-                        shape_input_raw, output_shape
-                    )));
+                    Vec::new()
                 }
             } else {
-                return Err(OnnxError::InvalidShape(format!(
-                    "Expand shape input {} must be constant for WebNN. Consider using --override-dim to resolve dynamic dimensions.",
-                    shape_input_raw
-                )));
+                Vec::new()
             }
         } else {
             shape_values
         };
 
+        if shape_values.is_empty() {
+            let output_dim_shape = node
+                .output
+                .as_slice()
+                .first()
+                .and_then(|out| {
+                    let out_s = out.to_string();
+                    context
+                        .value_shape_dims
+                        .get(&out_s)
+                        .or_else(|| context.value_shape_dims.get(&sanitize_identifier(&out_s)))
+                        .or_else(|| context.value_shape_dims.get(out_s.trim_start_matches('/')))
+                })
+                .cloned();
+            if let Some(dims) = output_dim_shape {
+                let json_dims: Vec<serde_json::Value> = dims
+                    .into_iter()
+                    .map(|d| match d {
+                        crate::ast::Dimension::Static(v) => serde_json::json!(v),
+                        crate::ast::Dimension::Dynamic(dd) => serde_json::json!({
+                            "name": dd.name,
+                            "maxSize": dd.max_size
+                        }),
+                    })
+                    .collect();
+                if !json_dims.is_empty() {
+                    dynamic_shape_json = Some(json_dims);
+                }
+            }
+        }
+
         // Determine if this is a broadcast (WebNN expand) or reshape operation
         // by checking if shapes are broadcast-compatible (ONNX Expand rules)
         let input_shape = context.value_shapes.get(&data_input_raw);
-        let op_type = if let Some(input_shape) = input_shape {
+        let op_type = if dynamic_shape_json.is_some() {
+            "expand"
+        } else if let Some(input_shape) = input_shape {
             // Check broadcast compatibility: align from right, dimensions must be equal or one must be 1
             let mut is_broadcast_compatible = true;
             let input_rank = input_shape.len();
@@ -586,10 +676,14 @@ impl ReshapeHandler {
         };
 
         let mut options = Map::new();
-        options.insert(
-            "newShape".to_string(),
-            serde_json::json!(shape_values.iter().map(|v| *v as u32).collect::<Vec<_>>()),
-        );
+        if let Some(json_dims) = dynamic_shape_json {
+            options.insert("newShape".to_string(), serde_json::json!(json_dims));
+        } else {
+            options.insert(
+                "newShape".to_string(),
+                serde_json::json!(shape_values.iter().map(|v| *v as u32).collect::<Vec<_>>()),
+            );
+        }
 
         let mut result = ConversionResult::new(vec![Node {
             id: output_name.clone(),
@@ -1091,6 +1185,7 @@ mod tests {
         let context = ConversionContext {
             initializers: &initializers,
             value_shapes: &value_shapes,
+            value_shape_dims: crate::onnx::ops::empty_value_shape_dims(),
             const_values: &const_values,
             value_ids: &value_ids,
             value_types: &value_types,
@@ -1134,6 +1229,7 @@ mod tests {
         let context = ConversionContext {
             initializers: &initializers,
             value_shapes: &value_shapes,
+            value_shape_dims: crate::onnx::ops::empty_value_shape_dims(),
             const_values: &const_values,
             value_ids: &value_ids,
             value_types: &value_types,
@@ -1162,6 +1258,7 @@ mod tests {
         let context = ConversionContext {
             initializers: &initializers,
             value_shapes: &value_shapes,
+            value_shape_dims: crate::onnx::ops::empty_value_shape_dims(),
             const_values: &const_values,
             value_ids: &value_ids,
             value_types: &value_types,
@@ -1191,6 +1288,7 @@ mod tests {
         let context = ConversionContext {
             initializers: &initializers,
             value_shapes: &value_shapes,
+            value_shape_dims: crate::onnx::ops::empty_value_shape_dims(),
             const_values: &const_values,
             value_ids: &value_ids,
             value_types: &value_types,
@@ -1218,6 +1316,7 @@ mod tests {
         let context = ConversionContext {
             initializers: &initializers,
             value_shapes: &value_shapes,
+            value_shape_dims: crate::onnx::ops::empty_value_shape_dims(),
             const_values: &const_values,
             value_ids: &value_ids,
             value_types: &value_types,
@@ -1243,6 +1342,7 @@ mod tests {
         let context = ConversionContext {
             initializers: &initializers,
             value_shapes: &value_shapes,
+            value_shape_dims: crate::onnx::ops::empty_value_shape_dims(),
             const_values: &const_values,
             value_ids: &value_ids,
             value_types: &value_types,
@@ -1267,6 +1367,7 @@ mod tests {
         let context = ConversionContext {
             initializers: &initializers,
             value_shapes: &value_shapes,
+            value_shape_dims: crate::onnx::ops::empty_value_shape_dims(),
             const_values: &const_values,
             value_ids: &value_ids,
             value_types: &value_types,
@@ -1320,6 +1421,7 @@ mod tests {
         let context = ConversionContext {
             initializers: &initializers,
             value_shapes: &value_shapes,
+            value_shape_dims: crate::onnx::ops::empty_value_shape_dims(),
             const_values: &const_values,
             value_ids: &value_ids,
             value_types: &value_types,
@@ -1356,6 +1458,7 @@ mod tests {
         let context = ConversionContext {
             initializers: &initializers,
             value_shapes: &value_shapes,
+            value_shape_dims: crate::onnx::ops::empty_value_shape_dims(),
             const_values: &const_values,
             value_ids: &value_ids,
             value_types: &value_types,
@@ -1394,6 +1497,7 @@ mod tests {
         let context = ConversionContext {
             initializers: &initializers,
             value_shapes: &value_shapes,
+            value_shape_dims: crate::onnx::ops::empty_value_shape_dims(),
             const_values: &const_values,
             value_ids: &value_ids,
             value_types: &value_types,

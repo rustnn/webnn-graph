@@ -4,6 +4,7 @@ use crate::ast::{ConstDecl, Node};
 use crate::onnx::convert::OnnxError;
 use crate::protos::onnx::{NodeProto, TensorProto};
 use std::collections::HashMap;
+use std::sync::OnceLock;
 
 pub mod activation;
 pub mod comparison;
@@ -35,6 +36,8 @@ pub struct ConversionContext<'a> {
     pub initializers: &'a HashMap<String, &'a TensorProto>,
     /// Map of value names to their shapes (for shape inference)
     pub value_shapes: &'a HashMap<String, Vec<i64>>,
+    /// Map of value names to shape dimensions preserving ONNX dim_param where available.
+    pub value_shape_dims: &'a HashMap<String, Vec<crate::ast::Dimension>>,
     /// Map of value names to constant integer contents (for const folding)
     pub const_values: &'a HashMap<String, Vec<i64>>,
     /// Map of ONNX value names to WebNN value identifiers
@@ -56,6 +59,11 @@ impl<'a> ConversionContext<'a> {
 
         sanitized
     }
+}
+
+pub fn empty_value_shape_dims() -> &'static HashMap<String, Vec<crate::ast::Dimension>> {
+    static EMPTY: OnceLock<HashMap<String, Vec<crate::ast::Dimension>>> = OnceLock::new();
+    EMPTY.get_or_init(HashMap::new)
 }
 
 /// Results of converting a single ONNX node
