@@ -1,6 +1,6 @@
 // Main ONNX to WebNN conversion logic
 
-use crate::ast::{to_dimension_vector, DataType, GraphJson};
+use crate::ast::{DataType, Dimension, DynamicDimension, GraphJson};
 use crate::protos::onnx::{
     tensor_shape_proto::dimension::Value as DimensionValue, type_proto::Value as TypeProtoValue,
     ModelProto, TensorProto, TensorProto_DataType,
@@ -651,6 +651,7 @@ impl OnnxConverter {
         let onnx_graph = self.model.graph.as_ref().unwrap();
         let mut value_name_map: HashMap<String, String> = HashMap::new();
         let mut effective_overrides = options.free_dim_overrides.clone();
+        let mut inference_overrides = effective_overrides.clone();
         let mut value_types: HashMap<String, DataType> = HashMap::new();
 
         // Merge overrides from model metadata if present
@@ -685,7 +686,8 @@ impl OnnxConverter {
             .map(|init| init.name.as_str().to_string())
             .collect();
 
-        let default_dim_values: HashMap<&str, u32> = HashMap::from([
+        let default_dynamic_max_size: u32 = 65_535;
+        let default_inference_dim_values: HashMap<&str, u32> = HashMap::from([
             ("batch_size", 1),
             ("batch", 1),
             ("n", 1),
@@ -695,12 +697,26 @@ impl OnnxConverter {
             ("seq", 128),
             ("s", 128),
             ("t", 128),
+            ("past_sequence_length", 64),
+            ("past_sequence_length + 1", 65),
         ]);
+        let dynamic_max_for_dim = |name: &str| -> u32 {
+            let lower = name.to_ascii_lowercase();
+            if lower.contains("past")
+                || lower.contains("seq")
+                || lower.contains("length")
+                || lower == "s"
+                || lower == "t"
+            {
+                4096
+            } else if lower.contains("batch") || lower == "b" || lower == "n" {
+                8
+            } else {
+                default_dynamic_max_size
+            }
+        };
 
-        let mut auto_applied: Vec<(String, u32)> = Vec::new();
-        let mut missing_dims: Vec<(String, String)> = Vec::new();
-
-        let mut resolve_dim_override =
+        let resolve_dim_override =
             |dim_param: &str, overrides: &mut HashMap<String, u32>| -> Option<u32> {
                 if let Some(v) = overrides.get(dim_param) {
                     return Some(*v);
@@ -710,13 +726,18 @@ impl OnnxConverter {
                 if let Some(v) = overrides.get(&lower) {
                     return Some(*v);
                 }
-
-                if let Some(default) = default_dim_values.get(lower.as_str()) {
-                    overrides.insert(dim_param.to_string(), *default);
-                    auto_applied.push((dim_param.to_string(), *default));
-                    return Some(*default);
+                None
+            };
+        let resolve_dim_for_inference =
+            |dim_param: &str, overrides: &mut HashMap<String, u32>| -> Option<u32> {
+                if let Some(v) = resolve_dim_override(dim_param, overrides) {
+                    return Some(v);
                 }
-
+                let lower = dim_param.to_ascii_lowercase();
+                if let Some(v) = default_inference_dim_values.get(lower.as_str()) {
+                    overrides.insert(dim_param.to_string(), *v);
+                    return Some(*v);
+                }
                 None
             };
 
@@ -740,31 +761,40 @@ impl OnnxConverter {
                     };
 
                     let shape = if let Some(shape_proto) = &tensor_type.shape {
-                        let mut resolved = Vec::new();
-                        for dim in &shape_proto.dim {
+                        let mut resolved: Vec<Dimension> = Vec::new();
+                        for (idx, dim) in shape_proto.dim.iter().enumerate() {
                             if let Some(dim_value) = &dim.value {
                                 match dim_value {
                                     DimensionValue::DimValue(v) => {
-                                        resolved.push(*v as u32);
+                                        if *v > 0 {
+                                            resolved.push(Dimension::Static(*v as u32));
+                                        } else {
+                                            resolved.push(Dimension::Dynamic(DynamicDimension {
+                                                name: format!("{}_dim{}", name, idx),
+                                                max_size: default_dynamic_max_size,
+                                            }));
+                                        }
                                     }
                                     DimensionValue::DimParam(dim_param) => {
                                         if let Some(v) = resolve_dim_override(
                                             dim_param,
                                             &mut effective_overrides,
                                         ) {
-                                            resolved.push(v);
+                                            resolved.push(Dimension::Static(v));
                                         } else {
-                                            missing_dims
-                                                .push((raw_name.clone(), dim_param.to_string()));
-                                            resolved.clear();
-                                            break;
+                                            let max_size = dynamic_max_for_dim(dim_param);
+                                            resolved.push(Dimension::Dynamic(DynamicDimension {
+                                                name: dim_param.to_string(),
+                                                max_size,
+                                            }));
                                         }
                                     }
                                 }
                             } else {
-                                missing_dims.push((raw_name.clone(), "<unknown>".to_string()));
-                                resolved.clear();
-                                break;
+                                resolved.push(Dimension::Dynamic(DynamicDimension {
+                                    name: format!("{}_dim{}", name, idx),
+                                    max_size: default_dynamic_max_size,
+                                }));
                             }
                         }
                         resolved
@@ -783,7 +813,7 @@ impl OnnxConverter {
                         name.clone(),
                         crate::ast::OperandDesc {
                             data_type: data_type.clone(),
-                            shape: to_dimension_vector(&shape),
+                            shape,
                         },
                     );
 
@@ -793,27 +823,6 @@ impl OnnxConverter {
                     value_types.insert(name.clone(), data_type);
                 }
             }
-        }
-
-        if !missing_dims.is_empty() {
-            let mut message = "Dynamic dimensions require explicit overrides:\n".to_string();
-            for (input, dim) in &missing_dims {
-                message.push_str(&format!(
-                    " - input '{}' dim '{}': --override-dim {}=<value>\n",
-                    input, dim, dim
-                ));
-            }
-            if !auto_applied.is_empty() {
-                message.push_str("Auto-applied defaults: ");
-                for (idx, (name, value)) in auto_applied.iter().enumerate() {
-                    if idx > 0 {
-                        message.push_str(", ");
-                    }
-                    message.push_str(&format!("{}={}", name, value));
-                }
-                message.push('\n');
-            }
-            return Err(OnnxError::InvalidShape(message));
         }
 
         // Process initializers (constants/weights)
@@ -912,9 +921,9 @@ impl OnnxConverter {
                                             shape.push(*v);
                                         }
                                         DimensionValue::DimParam(dim_param) => {
-                                            if let Some(v) = resolve_dim_override(
+                                            if let Some(v) = resolve_dim_for_inference(
                                                 dim_param,
-                                                &mut effective_overrides,
+                                                &mut inference_overrides,
                                             ) {
                                                 shape.push(v as i64);
                                             }
@@ -964,9 +973,9 @@ impl OnnxConverter {
                                         shape.push(*v);
                                     }
                                     DimensionValue::DimParam(dim_param) => {
-                                        if let Some(v) = resolve_dim_override(
+                                        if let Some(v) = resolve_dim_for_inference(
                                             dim_param,
-                                            &mut effective_overrides,
+                                            &mut inference_overrides,
                                         ) {
                                             shape.push(v as i64);
                                         } else {
@@ -1080,34 +1089,42 @@ impl OnnxConverter {
 
         // Run the static shape/type inference scaffold to seed shapes/types/constants
         // before lowering. Errors surface early if dynamic dims remain.
-        let inferred =
-            crate::onnx::shape_inference::infer_static_shapes(&self.model, &effective_overrides)
-                .map_err(|e| OnnxError::ShapeInference(e.to_string()))?;
-
-        // Initial seeding: use or_insert since these are the first values
-        // (no prior shapes to override)
-        for (k, v) in inferred.value_shapes {
-            value_shapes.entry(k).or_insert(v);
-        }
-        for (k, v) in inferred.value_types {
-            value_types.entry(k).or_insert(v);
-        }
-        for (k, v) in inferred.const_values {
-            // Use insert() instead of or_insert() to allow shape inference to correct
-            // earlier wrong values (e.g., Where operation heuristics)
-            if k.contains("rotary") && k.contains("Where") {
-                if let Some(old_val) = const_values.get(&k) {
-                    crate::debug_println!(
-                        "[CONVERT] Overwriting {} from {:?} to {:?}",
-                        k,
-                        old_val,
-                        v
-                    );
-                } else {
-                    crate::debug_println!("[CONVERT] Inserting new {} = {:?}", k, v);
+        match crate::onnx::shape_inference::infer_static_shapes(&self.model, &inference_overrides) {
+            Ok(inferred) => {
+                // Initial seeding: use or_insert since these are the first values
+                // (no prior shapes to override)
+                for (k, v) in inferred.value_shapes {
+                    value_shapes.entry(k).or_insert(v);
+                }
+                for (k, v) in inferred.value_types {
+                    value_types.entry(k).or_insert(v);
+                }
+                for (k, v) in inferred.const_values {
+                    // Use insert() instead of or_insert() to allow shape inference to correct
+                    // earlier wrong values (e.g., Where operation heuristics)
+                    if k.contains("rotary") && k.contains("Where") {
+                        if let Some(old_val) = const_values.get(&k) {
+                            crate::debug_println!(
+                                "[CONVERT] Overwriting {} from {:?} to {:?}",
+                                k,
+                                old_val,
+                                v
+                            );
+                        } else {
+                            crate::debug_println!("[CONVERT] Inserting new {} = {:?}", k, v);
+                        }
+                    }
+                    const_values.insert(k, v);
                 }
             }
-            const_values.insert(k, v);
+            Err(crate::onnx::shape_inference::ShapeInferenceError::DynamicDim { input, dim }) => {
+                crate::debug_println!(
+                    "[CONVERT] Skipping static shape inference due to unresolved dynamic dim '{}' on input '{}'",
+                    dim,
+                    input
+                );
+            }
+            Err(e) => return Err(OnnxError::ShapeInference(e.to_string())),
         }
 
         // Propagate shapes and fold constant shape expressions in a few passes
@@ -2084,5 +2101,67 @@ mod tests {
         // Verify MIN value
         let min_bytes: [u8; 8] = bytes[8..16].try_into().unwrap();
         assert_eq!(i64::from_le_bytes(min_bytes), i64::MIN);
+    }
+
+    #[test]
+    fn test_convert_preserves_dynamic_input_dim_without_override() {
+        use crate::protos::onnx::{tensor_shape_proto, type_proto};
+        use crate::protos::onnx::{GraphProto, ModelProto, TensorShapeProto, ValueInfoProto};
+
+        let dim_batch = tensor_shape_proto::Dimension {
+            value: Some(tensor_shape_proto::dimension::Value::DimParam(
+                "batch_size".to_string(),
+            )),
+            denotation: String::new(),
+        };
+        let dim_seq = tensor_shape_proto::Dimension {
+            value: Some(tensor_shape_proto::dimension::Value::DimValue(1)),
+            denotation: String::new(),
+        };
+        let shape = TensorShapeProto {
+            dim: vec![dim_batch, dim_seq],
+        };
+
+        let tensor_type = type_proto::Tensor {
+            elem_type: TensorProto_DataType::Int64.into(),
+            shape: Some(shape),
+        };
+        let type_proto = crate::protos::onnx::TypeProto {
+            value: Some(type_proto::Value::TensorType(tensor_type)),
+            denotation: String::new(),
+        };
+
+        let input_vi = ValueInfoProto {
+            name: "input_ids".to_string(),
+            r#type: Some(type_proto.clone()),
+            ..Default::default()
+        };
+        let output_vi = ValueInfoProto {
+            name: "input_ids".to_string(),
+            r#type: Some(type_proto),
+            ..Default::default()
+        };
+
+        let model = ModelProto {
+            graph: Some(GraphProto {
+                input: vec![input_vi],
+                output: vec![output_vi],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let converter = OnnxConverter::new(model).expect("converter");
+        let graph = converter
+            .convert(&ConvertOptions::default())
+            .expect("convert");
+
+        let input = graph.inputs.get("input_ids").expect("input_ids input");
+        assert_eq!(input.shape.len(), 2);
+        assert!(matches!(
+            &input.shape[0],
+            Dimension::Dynamic(d) if d.name == "batch_size"
+        ));
+        assert!(matches!(&input.shape[1], Dimension::Static(1)));
     }
 }

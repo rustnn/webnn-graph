@@ -33,7 +33,9 @@ null = { "null" }
 
 ty = { dtype ~ shape }
 dtype = { "f32" | "f16" | "i4" | "u4" | "i32" | "u32" | "i64" | "u64" | "i8" | "u8" }
-shape = { "[" ~ (int ~ ("," ~ int)*)? ~ "]" }
+shape = { "[" ~ (shape_dim ~ ("," ~ shape_dim)*)? ~ "]" }
+shape_dim = { dynamic_dim | int }
+dynamic_dim = { "dyn" ~ "(" ~ string ~ "," ~ int ~ ")" }
 quantized = { "@quantized" }
 
 // @weights("key") or @scalar(1.0) or @bytes([1,2,3])

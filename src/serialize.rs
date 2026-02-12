@@ -98,10 +98,11 @@ fn serialize_shape(shape: &[Dimension]) -> Result<String, SerializeError> {
         match dim {
             Dimension::Static(v) => dims.push(v.to_string()),
             Dimension::Dynamic(d) => {
-                return Err(SerializeError::InvalidFormat(format!(
-                    "dynamic dimension '{}' is not supported in wg text format",
-                    d.name
-                )));
+                dims.push(format!(
+                    "dyn(\"{}\", {})",
+                    escape_string(&d.name),
+                    d.max_size
+                ));
             }
         }
     }
@@ -217,6 +218,28 @@ mod tests {
         assert!(text.contains("nodes {"));
         assert!(text.contains("result = relu(x);"));
         assert!(text.contains("outputs { result; }"));
+    }
+
+    #[test]
+    fn test_serialize_dynamic_input_shape() {
+        let mut g = new_graph_json();
+        g.name = Some("dyn".to_string());
+        g.inputs.insert(
+            "x".to_string(),
+            OperandDesc {
+                data_type: DataType::Float32,
+                shape: vec![
+                    Dimension::Dynamic(crate::ast::DynamicDimension {
+                        name: "batch_size".to_string(),
+                        max_size: 8,
+                    }),
+                    Dimension::Static(128),
+                ],
+            },
+        );
+        g.outputs.insert("x".to_string(), "x".to_string());
+        let text = serialize_graph_to_wg_text(&g, SerializeOptions::default()).unwrap();
+        assert!(text.contains("x: f32[dyn(\"batch_size\", 8), 128];"));
     }
 
     #[test]

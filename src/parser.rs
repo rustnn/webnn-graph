@@ -1,5 +1,5 @@
 use crate::ast::{
-    new_graph_json, to_dimension_vector, ConstDecl, ConstInit, DataType, GraphJson, Node,
+    new_graph_json, ConstDecl, ConstInit, DataType, Dimension, DynamicDimension, GraphJson, Node,
     OperandDesc,
 };
 use pest::iterators::Pair;
@@ -21,6 +21,8 @@ pub enum ParseError {
     BadDType(String),
     #[error("internal error: {0}")]
     Internal(String),
+    #[error("constant shapes must be static")]
+    DynamicConstShape,
 }
 
 impl From<pest::error::Error<Rule>> for ParseError {
@@ -84,7 +86,7 @@ fn parse_inputs_block(
                 name,
                 OperandDesc {
                     data_type: dt,
-                    shape: to_dimension_vector(&shape),
+                    shape,
                 },
             );
         }
@@ -144,7 +146,7 @@ fn parse_consts_block(
                 name,
                 ConstDecl {
                     data_type: dt,
-                    shape,
+                    shape: dims_to_static_shape(&shape)?,
                     init,
                 },
             );
@@ -340,7 +342,7 @@ fn parse_outputs_block(
     Ok(())
 }
 
-fn parse_ty(p: Pair<Rule>) -> Result<(DataType, Vec<u32>), ParseError> {
+fn parse_ty(p: Pair<Rule>) -> Result<(DataType, Vec<Dimension>), ParseError> {
     let mut it = p.into_inner();
     let dt_s = it.next().unwrap().as_str();
     let dt = DataType::from_wg(dt_s).ok_or_else(|| ParseError::BadDType(dt_s.to_string()))?;
@@ -348,18 +350,52 @@ fn parse_ty(p: Pair<Rule>) -> Result<(DataType, Vec<u32>), ParseError> {
     Ok((dt, shape))
 }
 
-fn parse_shape(p: Pair<Rule>) -> Result<Vec<u32>, ParseError> {
+fn parse_shape(p: Pair<Rule>) -> Result<Vec<Dimension>, ParseError> {
     let mut shape = Vec::new();
     for inner in p.into_inner() {
-        if inner.as_rule() == Rule::int {
-            let v: u32 = inner
-                .as_str()
-                .parse()
-                .map_err(|_| ParseError::Internal("bad int".into()))?;
-            shape.push(v);
+        if inner.as_rule() == Rule::shape_dim {
+            let item = inner
+                .into_inner()
+                .next()
+                .ok_or_else(|| ParseError::Internal("shape_dim missing inner value".to_string()))?;
+            match item.as_rule() {
+                Rule::int => {
+                    let v: u32 = item
+                        .as_str()
+                        .parse()
+                        .map_err(|_| ParseError::Internal("bad int".into()))?;
+                    shape.push(Dimension::Static(v));
+                }
+                Rule::dynamic_dim => {
+                    let mut it = item.into_inner();
+                    let name = it
+                        .next()
+                        .map(|p| unquote(p.as_str()))
+                        .ok_or_else(|| ParseError::Internal("dynamic_dim missing name".into()))?;
+                    let max_size: u32 = it
+                        .next()
+                        .ok_or_else(|| ParseError::Internal("dynamic_dim missing max".into()))?
+                        .as_str()
+                        .parse()
+                        .map_err(|_| ParseError::Internal("dynamic_dim bad max".into()))?;
+                    shape.push(Dimension::Dynamic(DynamicDimension { name, max_size }));
+                }
+                _ => return Err(ParseError::Internal("unexpected shape_dim rule".into())),
+            }
         }
     }
     Ok(shape)
+}
+
+fn dims_to_static_shape(shape: &[Dimension]) -> Result<Vec<u32>, ParseError> {
+    let mut out = Vec::with_capacity(shape.len());
+    for dim in shape {
+        match dim {
+            Dimension::Static(v) => out.push(*v),
+            Dimension::Dynamic(_) => return Err(ParseError::DynamicConstShape),
+        }
+    }
+    Ok(out)
 }
 
 fn parse_value(p: Pair<Rule>) -> Result<Value, ParseError> {
@@ -454,11 +490,34 @@ webnn_graph "test" v1 {
 
         let x_desc = &graph.inputs["x"];
         assert_eq!(x_desc.data_type, DataType::Float32);
-        assert_eq!(x_desc.shape, to_dimension_vector(&[1, 10]));
+        assert_eq!(
+            x_desc.shape,
+            vec![Dimension::Static(1), Dimension::Static(10)]
+        );
 
         let y_desc = &graph.inputs["y"];
         assert_eq!(y_desc.data_type, DataType::Int32);
-        assert_eq!(y_desc.shape, to_dimension_vector(&[5]));
+        assert_eq!(y_desc.shape, vec![Dimension::Static(5)]);
+    }
+
+    #[test]
+    fn test_parse_dynamic_input_shape() {
+        let input = r#"
+webnn_graph "test" v2 {
+  inputs {
+    x: f32[dyn("batch_size", 8), 128];
+  }
+  nodes {}
+  outputs { x; }
+}
+"#;
+        let graph = parse_wg_text(input).unwrap();
+        let x_desc = &graph.inputs["x"];
+        assert!(matches!(
+            &x_desc.shape[0],
+            Dimension::Dynamic(d) if d.name == "batch_size" && d.max_size == 8
+        ));
+        assert!(matches!(&x_desc.shape[1], Dimension::Static(128)));
     }
 
     #[test]
