@@ -51,6 +51,10 @@ pub fn sanitize_identifier(name: &str) -> String {
 
 /// Convert ONNX data type code to WebNN DataType using shared utilities
 pub(crate) fn map_onnx_data_type(onnx_type: i32) -> Result<DataType, OnnxError> {
+    if onnx_type == TensorProto_DataType::Bool as i32 {
+        return Ok(DataType::Uint8);
+    }
+
     let utils_dtype = utils_data_types::onnx_to_webnn(onnx_type)?;
     Ok(match utils_dtype {
         utils_data_types::DataType::Float32 => DataType::Float32,
