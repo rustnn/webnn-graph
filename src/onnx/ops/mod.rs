@@ -59,6 +59,45 @@ impl<'a> ConversionContext<'a> {
 
         sanitized
     }
+
+    pub fn resolve_shape(&self, name: &str) -> Option<&Vec<i64>> {
+        let sanitized = crate::onnx::convert::sanitize_identifier(name);
+        let trimmed = name.trim_start_matches('/');
+        self.value_shapes
+            .get(name)
+            .or_else(|| self.value_shapes.get(&sanitized))
+            .or_else(|| self.value_shapes.get(trimmed))
+    }
+
+    pub fn input_rank(&self, name: &str) -> Option<usize> {
+        self.resolve_shape(name).map(|s| s.len())
+    }
+}
+
+pub fn normalize_axis(axis: i64, rank: usize) -> Result<i64, OnnxError> {
+    let rank_i64 = rank as i64;
+    let normalized = if axis < 0 { axis + rank_i64 } else { axis };
+    if normalized < 0 || normalized >= rank_i64 {
+        return Err(OnnxError::InvalidShape(format!(
+            "axis {} is out of bounds for rank {}",
+            axis, rank
+        )));
+    }
+    Ok(normalized)
+}
+
+pub fn normalize_axes(axes: &[i64], rank: usize) -> Result<Vec<i64>, OnnxError> {
+    axes.iter().map(|&a| normalize_axis(a, rank)).collect()
+}
+
+pub fn normalize_axis_best_effort(axis: i64, rank: usize) -> i64 {
+    normalize_axis(axis, rank).unwrap_or(axis)
+}
+
+pub fn normalize_axes_best_effort(axes: &[i64], rank: usize) -> Vec<i64> {
+    axes.iter()
+        .map(|&a| normalize_axis_best_effort(a, rank))
+        .collect()
 }
 
 pub fn empty_value_shape_dims() -> &'static HashMap<String, Vec<crate::ast::Dimension>> {

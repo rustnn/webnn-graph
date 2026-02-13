@@ -2,7 +2,10 @@
 
 use crate::ast::Node;
 use crate::onnx::convert::{sanitize_identifier, OnnxError};
-use crate::onnx::ops::{ConversionContext, ConversionResult, OpHandler};
+use crate::onnx::ops::{
+    normalize_axes_best_effort, normalize_axis_best_effort, ConversionContext, ConversionResult,
+    OpHandler,
+};
 use crate::protos::onnx::{NodeProto, TensorProto_DataType};
 use serde_json::Map;
 
@@ -188,6 +191,23 @@ impl ReshapeHandler {
 
         // Fallback: derive shape from known input shape when the shape tensor isn't const.
         if shape_values.is_empty() {
+            if let Some(out_name) = node.output.as_slice().first() {
+                let out_s = out_name.to_string();
+                let known_output_shape = context
+                    .value_shapes
+                    .get(&out_s)
+                    .or_else(|| context.value_shapes.get(&sanitize_identifier(&out_s)))
+                    .or_else(|| context.value_shapes.get(out_s.trim_start_matches('/')))
+                    .cloned();
+                if let Some(out_shape) = known_output_shape {
+                    if !out_shape.is_empty() && out_shape.iter().all(|&d| d > 0) {
+                        shape_values = out_shape;
+                    }
+                }
+            }
+        }
+
+        if shape_values.is_empty() {
             if let Some(ds) = context.value_shapes.get(data_input_raw.as_str()) {
                 if ds.len() >= 3 {
                     let tail: i64 = ds[2..].iter().product();
@@ -268,8 +288,9 @@ impl ReshapeHandler {
                 }
 
                 return Err(OnnxError::InvalidShape(format!(
-                    "Reshape shape input '{}' must be a constant (initializer/constant-folded) or input shape must be known.",
-                    shape_input_raw
+                    "Reshape shape input '{}' must be a constant (initializer/constant-folded) or input shape must be known. \
+                     data input='{}', resolved='{}'.",
+                    shape_input_raw, data_input_raw, data_input
                 )));
             }
         } else if shape_from_const
@@ -792,6 +813,12 @@ impl ReshapeHandler {
         let sanitized_inputs: Vec<String> =
             inputs.iter().map(|s| context.resolve_input(s)).collect();
 
+        let axis = if let Some(rank) = context.input_rank(inputs[0].as_str()) {
+            normalize_axis_best_effort(axis, rank)
+        } else {
+            axis
+        };
+
         let mut options = Map::new();
         options.insert("axis".to_string(), serde_json::json!(axis));
 
@@ -856,6 +883,12 @@ impl ReshapeHandler {
             .iter()
             .map(|s| sanitize_identifier(&s.to_string()))
             .collect();
+
+        let axis = if let Some(rank) = context.input_rank(inputs[0].as_str()) {
+            normalize_axis_best_effort(axis, rank)
+        } else {
+            axis
+        };
 
         let mut options = Map::new();
         options.insert("axis".to_string(), serde_json::json!(axis));
@@ -930,6 +963,11 @@ impl ReshapeHandler {
                 from_const
             }
         };
+        let axes_values = if let Some(rank) = context.input_rank(inputs[0].as_str()) {
+            normalize_axes_best_effort(&axes_values, rank)
+        } else {
+            axes_values
+        };
 
         let mut options = Map::new();
         options.insert("axes".to_string(), serde_json::json!(axes_values.clone()));
@@ -992,6 +1030,11 @@ impl ReshapeHandler {
             a
         } else {
             self.read_axes_from_attr_or_const(node, context)?
+        };
+        let axes_values = if let Some(rank) = context.input_rank(inputs[0].as_str()) {
+            normalize_axes_best_effort(&axes_values, rank)
+        } else {
+            axes_values
         };
 
         let mut options = Map::new();
@@ -1246,6 +1289,64 @@ mod tests {
     }
 
     #[test]
+    fn test_convert_reshape_errors_when_shape_non_const_and_input_unknown() {
+        let handler = ReshapeHandler;
+        let node = create_test_node("Reshape", vec!["data", "shape_dyn"], vec!["reshaped"]);
+
+        let initializers = std::collections::HashMap::new();
+        let value_shapes = std::collections::HashMap::new();
+        let const_values = std::collections::HashMap::new();
+        let value_ids = std::collections::HashMap::new();
+        let value_types = std::collections::HashMap::new();
+        let context = ConversionContext {
+            initializers: &initializers,
+            value_shapes: &value_shapes,
+            value_shape_dims: crate::onnx::ops::empty_value_shape_dims(),
+            const_values: &const_values,
+            value_ids: &value_ids,
+            value_types: &value_types,
+        };
+
+        let err = handler
+            .convert(&node, &context)
+            .expect_err("expected reshape error");
+        let msg = err.to_string();
+        assert!(msg.contains("shape input"));
+        assert!(msg.contains("must be a constant"));
+    }
+
+    #[test]
+    fn test_convert_reshape_uses_known_output_shape_when_shape_input_non_const() {
+        let handler = ReshapeHandler;
+        let node = create_test_node("Reshape", vec!["data", "shape_dyn"], vec!["reshaped"]);
+
+        let initializers = std::collections::HashMap::new();
+        let mut value_shapes = std::collections::HashMap::new();
+        value_shapes.insert("reshaped".to_string(), vec![1, 128, 384]);
+        let const_values = std::collections::HashMap::new();
+        let value_ids = std::collections::HashMap::new();
+        let value_types = std::collections::HashMap::new();
+        let context = ConversionContext {
+            initializers: &initializers,
+            value_shapes: &value_shapes,
+            value_shape_dims: crate::onnx::ops::empty_value_shape_dims(),
+            const_values: &const_values,
+            value_ids: &value_ids,
+            value_types: &value_types,
+        };
+
+        let result = handler
+            .convert(&node, &context)
+            .expect("reshape should convert");
+        assert_eq!(result.nodes.len(), 1);
+        assert_eq!(result.nodes[0].op, "reshape");
+        assert_eq!(
+            result.nodes[0].options.get("newShape"),
+            Some(&serde_json::json!([1, 128, 384]))
+        );
+    }
+
+    #[test]
     fn test_convert_transpose() {
         let handler = ReshapeHandler;
         let mut node = create_test_node("Transpose", vec!["x"], vec!["y"]);
@@ -1307,9 +1408,12 @@ mod tests {
     fn test_convert_concat() {
         let handler = ReshapeHandler;
         let mut node = create_test_node("Concat", vec!["a", "b", "c"], vec!["result"]);
-        add_int_attribute(&mut node, "axis", 1);
+        add_int_attribute(&mut node, "axis", -1);
         let initializers = std::collections::HashMap::new();
-        let value_shapes = std::collections::HashMap::new();
+        let mut value_shapes = std::collections::HashMap::new();
+        value_shapes.insert("a".to_string(), vec![1, 2, 3]);
+        value_shapes.insert("b".to_string(), vec![1, 2, 3]);
+        value_shapes.insert("c".to_string(), vec![1, 2, 3]);
         let const_values = std::collections::HashMap::new();
         let value_ids = std::collections::HashMap::new();
         let value_types = std::collections::HashMap::new();
@@ -1327,15 +1431,20 @@ mod tests {
         assert_eq!(result.nodes[0].op, "concat");
         assert_eq!(result.nodes[0].inputs.len(), 3);
         assert!(result.nodes[0].options.contains_key("axis"));
+        assert_eq!(
+            result.nodes[0].options.get("axis"),
+            Some(&serde_json::json!(2))
+        );
     }
 
     #[test]
     fn test_convert_split() {
         let handler = ReshapeHandler;
         let mut node = create_test_node("Split", vec!["x"], vec!["y1", "y2"]);
-        add_int_attribute(&mut node, "axis", 0);
+        add_int_attribute(&mut node, "axis", -1);
         let initializers = std::collections::HashMap::new();
-        let value_shapes = std::collections::HashMap::new();
+        let mut value_shapes = std::collections::HashMap::new();
+        value_shapes.insert("x".to_string(), vec![1, 2, 4]);
         let const_values = std::collections::HashMap::new();
         let value_ids = std::collections::HashMap::new();
         let value_types = std::collections::HashMap::new();
@@ -1352,6 +1461,10 @@ mod tests {
         assert_eq!(result.nodes.len(), 1);
         assert_eq!(result.nodes[0].op, "split");
         assert!(result.nodes[0].outputs.is_some());
+        assert_eq!(
+            result.nodes[0].options.get("axis"),
+            Some(&serde_json::json!(2))
+        );
     }
 
     #[test]

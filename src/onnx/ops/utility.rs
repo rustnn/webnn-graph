@@ -3,7 +3,9 @@
 use crate::ast::Node;
 use crate::ast::{ConstDecl, ConstInit, DataType};
 use crate::onnx::convert::{sanitize_identifier, OnnxError};
-use crate::onnx::ops::{ConversionContext, ConversionResult, OpHandler};
+use crate::onnx::ops::{
+    normalize_axis_best_effort, ConversionContext, ConversionResult, OpHandler,
+};
 use crate::protos::onnx::NodeProto;
 use serde_json::{json, Map};
 
@@ -428,6 +430,12 @@ impl UtilityHandler {
         let input0 = context.resolve_input(&inputs[0]);
         let input1 = context.resolve_input(&inputs[1]);
 
+        let axis = if let Some(rank) = context.input_rank(inputs[0].as_str()) {
+            normalize_axis_best_effort(axis, rank)
+        } else {
+            axis
+        };
+
         let mut options = Map::new();
         options.insert("axis".to_string(), serde_json::json!(axis));
 
@@ -436,10 +444,7 @@ impl UtilityHandler {
             context.value_shapes.get(&inputs[0]),
             context.value_shapes.get(&inputs[1]),
         ) {
-            let mut resolved_axis = axis;
-            if resolved_axis < 0 {
-                resolved_axis += data_shape.len() as i64;
-            }
+            let resolved_axis = axis;
             if resolved_axis >= 0 && (resolved_axis as usize) < data_shape.len() {
                 let axis_idx = resolved_axis as usize;
                 let mut out_shape = Vec::new();
@@ -628,16 +633,90 @@ impl UtilityHandler {
                 ends_norm.resize(desired_len, fill);
             }
 
-            options.insert("starts".to_string(), serde_json::json!(starts_norm));
-            options.insert("ends".to_string(), serde_json::json!(ends_norm));
+            if let Some(input_shape) = context.resolve_shape(inputs[0].as_str()) {
+                let rank = input_shape.len();
+                let mut axes = if let Some(a) = axes_opt {
+                    if a.is_empty() {
+                        (0..desired_len as i64).collect::<Vec<_>>()
+                    } else {
+                        a
+                    }
+                } else {
+                    (0..desired_len as i64).collect::<Vec<_>>()
+                };
+                if axes.len() != desired_len {
+                    axes.resize(desired_len, 0);
+                }
+                let axes: Vec<i64> = axes
+                    .iter()
+                    .map(|&a| normalize_axis_best_effort(a, rank))
+                    .collect();
 
-            if let Some(axes) = axes_opt {
-                options.insert("axes".to_string(), serde_json::json!(axes));
-            }
-            if inputs.len() >= 5 {
-                let steps_name = inputs[4].as_str();
-                if let Some(steps) = read_ints(steps_name, context) {
-                    options.insert("steps".to_string(), serde_json::json!(steps));
+                let mut steps = if inputs.len() >= 5 {
+                    let steps_name = inputs[4].as_str();
+                    read_ints(steps_name, context).unwrap_or_default()
+                } else {
+                    Vec::new()
+                };
+                if steps.len() > desired_len {
+                    steps.truncate(desired_len);
+                } else {
+                    steps.resize(desired_len, 1);
+                }
+
+                let mut dense_starts = vec![0i64; rank];
+                let mut dense_sizes: Vec<i64> = input_shape.clone();
+                let mut dense_strides = vec![1i64; rank];
+
+                for i in 0..desired_len {
+                    let axis = axes[i] as usize;
+                    let dim = input_shape[axis];
+                    let step = steps[i];
+                    if step <= 0 {
+                        return Err(OnnxError::InvalidShape(
+                            "Slice currently requires positive step values".to_string(),
+                        ));
+                    }
+
+                    let mut start = starts_norm[i];
+                    let mut end = ends_norm[i];
+                    if start < 0 {
+                        start += dim;
+                    }
+                    if end == i64::MAX {
+                        end = dim;
+                    } else if end < 0 {
+                        end += dim;
+                    }
+                    start = start.clamp(0, dim);
+                    end = end.clamp(0, dim);
+
+                    let size = if end <= start {
+                        0
+                    } else {
+                        (end - start + step - 1) / step
+                    };
+
+                    dense_starts[axis] = start;
+                    dense_sizes[axis] = size;
+                    dense_strides[axis] = step;
+                }
+
+                options.insert("starts".to_string(), serde_json::json!(dense_starts));
+                options.insert("sizes".to_string(), serde_json::json!(dense_sizes));
+                options.insert("strides".to_string(), serde_json::json!(dense_strides));
+            } else {
+                // Fallback for unknown-rank tensors: keep ONNX-style static slice options.
+                options.insert("starts".to_string(), serde_json::json!(starts_norm));
+                options.insert("ends".to_string(), serde_json::json!(ends_norm));
+                if let Some(axes) = axes_opt {
+                    options.insert("axes".to_string(), serde_json::json!(axes));
+                }
+                if inputs.len() >= 5 {
+                    let steps_name = inputs[4].as_str();
+                    if let Some(steps) = read_ints(steps_name, context) {
+                        options.insert("steps".to_string(), serde_json::json!(steps));
+                    }
                 }
             }
         } else {
@@ -664,6 +743,89 @@ impl UtilityHandler {
                 return Err(OnnxError::InvalidShape(
                     "Slice requires static starts/ends".to_string(),
                 ));
+            }
+
+            if let Some(input_shape) = context.resolve_shape(inputs[0].as_str()) {
+                let rank = input_shape.len();
+                let starts = options
+                    .remove("starts")
+                    .and_then(|v| serde_json::from_value::<Vec<i64>>(v).ok())
+                    .ok_or_else(|| OnnxError::InvalidShape("Slice starts malformed".to_string()))?;
+                let ends = options
+                    .remove("ends")
+                    .and_then(|v| serde_json::from_value::<Vec<i64>>(v).ok())
+                    .ok_or_else(|| OnnxError::InvalidShape("Slice ends malformed".to_string()))?;
+                let axes = options
+                    .remove("axes")
+                    .and_then(|v| serde_json::from_value::<Vec<i64>>(v).ok())
+                    .unwrap_or_else(|| (0..starts.len() as i64).collect::<Vec<_>>());
+                let mut steps = options
+                    .remove("steps")
+                    .and_then(|v| serde_json::from_value::<Vec<i64>>(v).ok())
+                    .unwrap_or_else(|| vec![1; starts.len()]);
+
+                let desired_len = starts.len().max(ends.len()).max(axes.len());
+                let mut starts = starts;
+                let mut ends = ends;
+                let mut axes = axes;
+                if starts.len() < desired_len {
+                    starts.resize(desired_len, 0);
+                }
+                if ends.len() < desired_len {
+                    ends.resize(desired_len, i64::MAX);
+                }
+                if axes.len() < desired_len {
+                    axes.resize(desired_len, 0);
+                }
+                if steps.len() < desired_len {
+                    steps.resize(desired_len, 1);
+                }
+
+                let axes: Vec<i64> = axes
+                    .iter()
+                    .map(|&a| normalize_axis_best_effort(a, rank))
+                    .collect();
+                let mut dense_starts = vec![0i64; rank];
+                let mut dense_sizes: Vec<i64> = input_shape.clone();
+                let mut dense_strides = vec![1i64; rank];
+
+                for i in 0..desired_len {
+                    let axis = axes[i] as usize;
+                    let dim = input_shape[axis];
+                    let step = steps[i];
+                    if step <= 0 {
+                        return Err(OnnxError::InvalidShape(
+                            "Slice currently requires positive step values".to_string(),
+                        ));
+                    }
+
+                    let mut start = starts[i];
+                    let mut end = ends[i];
+                    if start < 0 {
+                        start += dim;
+                    }
+                    if end == i64::MAX {
+                        end = dim;
+                    } else if end < 0 {
+                        end += dim;
+                    }
+                    start = start.clamp(0, dim);
+                    end = end.clamp(0, dim);
+
+                    let size = if end <= start {
+                        0
+                    } else {
+                        (end - start + step - 1) / step
+                    };
+
+                    dense_starts[axis] = start;
+                    dense_sizes[axis] = size;
+                    dense_strides[axis] = step;
+                }
+
+                options.insert("starts".to_string(), serde_json::json!(dense_starts));
+                options.insert("sizes".to_string(), serde_json::json!(dense_sizes));
+                options.insert("strides".to_string(), serde_json::json!(dense_strides));
             }
         }
 
@@ -753,9 +915,11 @@ mod tests {
     fn test_convert_gather() {
         let handler = UtilityHandler;
         let mut node = create_test_node("Gather", vec!["data", "indices"], vec!["output"]);
-        add_int_attribute(&mut node, "axis", 1);
+        add_int_attribute(&mut node, "axis", -1);
         let initializers = std::collections::HashMap::new();
-        let value_shapes = std::collections::HashMap::new();
+        let mut value_shapes = std::collections::HashMap::new();
+        value_shapes.insert("data".to_string(), vec![2, 3, 4]);
+        value_shapes.insert("indices".to_string(), vec![2]);
         let const_values = std::collections::HashMap::new();
         let value_ids = std::collections::HashMap::new();
         let value_types = std::collections::HashMap::new();
@@ -773,17 +937,28 @@ mod tests {
         assert_eq!(result.nodes[0].op, "gather");
         assert_eq!(result.nodes[0].inputs.len(), 2);
         assert!(result.nodes[0].options.contains_key("axis"));
+        assert_eq!(
+            result.nodes[0].options.get("axis"),
+            Some(&serde_json::json!(2))
+        );
     }
 
     #[test]
     fn test_convert_slice() {
         let handler = UtilityHandler;
-        let node = create_test_node("Slice", vec!["x", "starts", "ends"], vec!["output"]);
+        let node = create_test_node(
+            "Slice",
+            vec!["x", "starts", "ends", "axes", "steps"],
+            vec!["output"],
+        );
         let initializers = std::collections::HashMap::new();
-        let value_shapes = std::collections::HashMap::new();
+        let mut value_shapes = std::collections::HashMap::new();
+        value_shapes.insert("x".to_string(), vec![1, 128]);
         let mut const_values = std::collections::HashMap::new();
-        const_values.insert("starts".to_string(), vec![0, 1]);
-        const_values.insert("ends".to_string(), vec![3, 3]);
+        const_values.insert("starts".to_string(), vec![0]);
+        const_values.insert("ends".to_string(), vec![128]);
+        const_values.insert("axes".to_string(), vec![1]);
+        const_values.insert("steps".to_string(), vec![1]);
         let value_ids = std::collections::HashMap::new();
         let value_types = std::collections::HashMap::new();
         let context = ConversionContext {
@@ -800,6 +975,21 @@ mod tests {
         assert_eq!(result.nodes[0].op, "slice");
         assert_eq!(result.nodes[0].inputs, vec!["x"]);
         assert!(result.nodes[0].options.contains_key("starts"));
+        assert_eq!(
+            result.nodes[0].options.get("starts"),
+            Some(&serde_json::json!([0, 0]))
+        );
+        assert_eq!(
+            result.nodes[0].options.get("sizes"),
+            Some(&serde_json::json!([1, 128]))
+        );
+        assert_eq!(
+            result.nodes[0].options.get("strides"),
+            Some(&serde_json::json!([1, 1]))
+        );
+        assert!(!result.nodes[0].options.contains_key("ends"));
+        assert!(!result.nodes[0].options.contains_key("axes"));
+        assert!(!result.nodes[0].options.contains_key("steps"));
     }
 
     #[test]

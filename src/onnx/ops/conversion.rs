@@ -8,6 +8,21 @@ use serde_json::Map;
 
 pub struct ConversionHandler;
 
+fn dtype_to_webnn_string(dt: &crate::ast::DataType) -> &'static str {
+    match dt {
+        crate::ast::DataType::Float32 => "float32",
+        crate::ast::DataType::Float16 => "float16",
+        crate::ast::DataType::Int4 => "int4",
+        crate::ast::DataType::Uint4 => "uint4",
+        crate::ast::DataType::Int32 => "int32",
+        crate::ast::DataType::Uint32 => "uint32",
+        crate::ast::DataType::Int64 => "int64",
+        crate::ast::DataType::Uint64 => "uint64",
+        crate::ast::DataType::Int8 => "int8",
+        crate::ast::DataType::Uint8 => "uint8",
+    }
+}
+
 impl OpHandler for ConversionHandler {
     fn supports(&self, op_type: &str) -> bool {
         matches!(op_type, "Cast" | "Constant")
@@ -82,7 +97,7 @@ impl ConversionHandler {
         let mut options = Map::new();
         options.insert(
             "to".to_string(),
-            serde_json::json!(format!("{:?}", target_type)),
+            serde_json::json!(dtype_to_webnn_string(&target_type)),
         );
 
         let mut result = ConversionResult::new(vec![Node {
@@ -140,7 +155,7 @@ impl ConversionHandler {
         let mut options = Map::new();
         options.insert(
             "dataType".to_string(),
-            serde_json::json!(format!("{:?}", data_type)),
+            serde_json::json!(dtype_to_webnn_string(&data_type)),
         );
         options.insert("shape".to_string(), serde_json::json!(shape));
 
@@ -222,5 +237,47 @@ mod tests {
         assert_eq!(result.nodes[0].op, "cast");
         assert_eq!(result.nodes[0].inputs, vec!["x"]);
         assert!(result.nodes[0].options.contains_key("to"));
+        assert_eq!(
+            result.nodes[0].options.get("to"),
+            Some(&serde_json::json!("int64"))
+        );
+    }
+
+    #[test]
+    fn test_convert_constant_uses_lowercase_dtype_and_base64_data() {
+        let handler = ConversionHandler;
+        let mut node = create_test_node("Constant", vec![], vec!["c0"]);
+        let tensor = crate::protos::onnx::TensorProto {
+            data_type: crate::protos::onnx::TensorProto_DataType::Float as i32,
+            dims: vec![1],
+            raw_data: vec![0, 0, 128, 63], // 1.0f32
+            ..Default::default()
+        };
+        node.attribute.push(AttributeProto {
+            name: "value".to_string(),
+            t: Some(tensor),
+            ..Default::default()
+        });
+
+        let result = handler
+            .convert(
+                &node,
+                &ConversionContext {
+                    initializers: &std::collections::HashMap::new(),
+                    value_shapes: &std::collections::HashMap::new(),
+                    value_shape_dims: crate::onnx::ops::empty_value_shape_dims(),
+                    const_values: &std::collections::HashMap::new(),
+                    value_ids: &std::collections::HashMap::new(),
+                    value_types: &std::collections::HashMap::new(),
+                },
+            )
+            .unwrap();
+
+        assert_eq!(result.nodes.len(), 1);
+        assert_eq!(
+            result.nodes[0].options.get("dataType"),
+            Some(&serde_json::json!("float32"))
+        );
+        assert!(result.nodes[0].options.get("data").is_some());
     }
 }

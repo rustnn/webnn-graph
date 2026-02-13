@@ -2,7 +2,9 @@
 
 use crate::ast::Node;
 use crate::onnx::convert::{sanitize_identifier, OnnxError};
-use crate::onnx::ops::{ConversionContext, ConversionResult, OpHandler};
+use crate::onnx::ops::{
+    normalize_axes_best_effort, ConversionContext, ConversionResult, OpHandler,
+};
 use crate::protos::onnx::NodeProto;
 use serde_json::Map;
 
@@ -88,6 +90,11 @@ impl ReductionHandler {
 
         // Add axes if specified
         if let Some(axes_values) = axes {
+            let axes_values = if let Some(rank) = context.input_rank(inputs[0].as_str()) {
+                normalize_axes_best_effort(&axes_values, rank)
+            } else {
+                axes_values
+            };
             options.insert("axes".to_string(), serde_json::json!(axes_values));
         }
 
@@ -190,9 +197,10 @@ mod tests {
     fn test_convert_reduce_sum() {
         let handler = ReductionHandler;
         let mut node = create_test_node("ReduceSum", vec!["x"], vec!["y"]);
-        add_ints_attribute(&mut node, "axes", vec![0]);
+        add_ints_attribute(&mut node, "axes", vec![-1]);
         let initializers = std::collections::HashMap::new();
-        let value_shapes = std::collections::HashMap::new();
+        let mut value_shapes = std::collections::HashMap::new();
+        value_shapes.insert("x".to_string(), vec![2, 3, 4]);
         let const_values = std::collections::HashMap::new();
         let value_ids = std::collections::HashMap::new();
         let value_types = std::collections::HashMap::new();
@@ -208,5 +216,9 @@ mod tests {
         let result = handler.convert(&node, &context).unwrap();
         assert_eq!(result.nodes.len(), 1);
         assert_eq!(result.nodes[0].op, "reduceSum");
+        assert_eq!(
+            result.nodes[0].options.get("axes"),
+            Some(&serde_json::json!([2]))
+        );
     }
 }

@@ -319,6 +319,28 @@ Observed output from that run:
 - `/tmp/smol_hf.weights`: ~513 MB
 - `/tmp/smol_hf.manifest.json`: ~423 KB
 
+### Example: Converting all-MiniLM-L6-v2
+
+Download the ONNX model:
+
+```bash
+curl -L "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/onnx/model.onnx?download=true" \
+  -o /tmp/minilm.onnx
+```
+
+Convert with common sentence-embedding overrides:
+
+```bash
+webnn-graph convert-onnx \
+  --input /tmp/minilm.onnx \
+  --optimize \
+  --override-dim batch_size=1 \
+  --override-dim sequence_length=128 \
+  --output /tmp/minilm.webnn \
+  --weights /tmp/minilm.weights \
+  --manifest /tmp/minilm.manifest.json
+```
+
 ### Supported ONNX Operations
 
 The converter focuses on NLP/Transformer operations:

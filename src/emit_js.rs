@@ -27,6 +27,46 @@ fn shape_to_js(shape: &[Dimension]) -> String {
     format!("[{}]", dims.join(", "))
 }
 
+fn normalize_dtype_name(name: &str) -> Option<&'static str> {
+    match name.to_ascii_lowercase().as_str() {
+        "float32" => Some("float32"),
+        "float16" => Some("float16"),
+        "int4" => Some("int4"),
+        "uint4" => Some("uint4"),
+        "int32" => Some("int32"),
+        "uint32" => Some("uint32"),
+        "int64" => Some("int64"),
+        "uint64" => Some("uint64"),
+        "int8" => Some("int8"),
+        "uint8" => Some("uint8"),
+        _ => None,
+    }
+}
+
+fn normalize_options_for_js(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(obj) => {
+            for (k, v) in obj.iter_mut() {
+                if k == "dataType" || k == "to" {
+                    if let Some(s) = v.as_str() {
+                        if let Some(norm) = normalize_dtype_name(s) {
+                            *v = serde_json::Value::String(norm.to_string());
+                            continue;
+                        }
+                    }
+                }
+                normalize_options_for_js(v);
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            for v in arr {
+                normalize_options_for_js(v);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Emit the WeightsFile helper class for loading weights
 pub fn emit_weights_loader_js() -> &'static str {
     r#"/**
@@ -174,31 +214,64 @@ pub fn emit_builder_js(g: &GraphJson) -> String {
     s.push('\n');
 
     for n in &g.nodes {
+        if n.op == "constant" {
+            let mut opts = serde_json::Value::Object(n.options.clone());
+            normalize_options_for_js(&mut opts);
+            let dtype = opts
+                .get("dataType")
+                .and_then(|v| v.as_str())
+                .and_then(normalize_dtype_name)
+                .unwrap_or("float32");
+            let shape = opts
+                .get("shape")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!([]))
+                .to_string();
+            let data = opts
+                .get("data")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            s.push_str(&format!(
+                "  {{\n    const b64 = {data:?};\n    const bytes = Uint8Array.from(atob(b64), c => c.charCodeAt(0));\n    env.set({id:?}, builder.constant({{ dataType: {dtype:?}, shape: {shape} }}, bytes.buffer));\n  }}\n",
+                id = n.id,
+                data = data,
+                dtype = dtype,
+                shape = shape
+            ));
+            continue;
+        }
+
         let ins = n
             .inputs
             .iter()
             .map(|x| format!("env.get({:?})", x))
             .collect::<Vec<_>>()
             .join(", ");
-        let opts = serde_json::Value::Object(n.options.clone()).to_string();
-        if let Some(outs) = &n.outputs {
-            s.push_str(&format!(
-                "  {{\n    const tmp = builder[{op:?}]({ins}, {opts});\n",
+        let mut opts_val = serde_json::Value::Object(n.options.clone());
+        normalize_options_for_js(&mut opts_val);
+        let opts = opts_val.to_string();
+        let call = if ins.is_empty() {
+            format!("builder[{op:?}]({opts})", op = n.op, opts = opts)
+        } else {
+            format!(
+                "builder[{op:?}]({ins}, {opts})",
                 op = n.op,
                 ins = ins,
                 opts = opts
-            ));
+            )
+        };
+        if let Some(outs) = &n.outputs {
+            s.push_str(&format!("  {{\n    const tmp = {call};\n", call = call));
             for (i, o) in outs.iter().enumerate() {
                 s.push_str(&format!("    env.set({o:?}, tmp[{i}]);\n", o = o, i = i));
             }
             s.push_str("  }\n");
         } else {
             s.push_str(&format!(
-                "  env.set({id:?}, builder[{op:?}]({ins}, {opts}));\n",
+                "  env.set({id:?}, {call});\n",
                 id = n.id,
-                op = n.op,
-                ins = ins,
-                opts = opts
+                call = call
             ));
         }
     }
@@ -381,6 +454,51 @@ mod tests {
         let js = emit_builder_js(&g);
         assert!(js.contains("builder[\"softmax\"]"));
         assert!(js.contains("\"axis\":1"));
+    }
+
+    #[test]
+    fn test_emit_cast_normalizes_dtype_option() {
+        let mut g = new_graph_json();
+        g.inputs.insert(
+            "x".to_string(),
+            OperandDesc {
+                data_type: DataType::Float32,
+                shape: to_dimension_vector(&[1]),
+            },
+        );
+        let mut options = serde_json::Map::new();
+        options.insert("to".to_string(), serde_json::json!("Int32"));
+        g.nodes.push(Node {
+            id: "y".to_string(),
+            op: "cast".to_string(),
+            inputs: vec!["x".to_string()],
+            options,
+            outputs: None,
+        });
+        g.outputs.insert("y".to_string(), "y".to_string());
+        let js = emit_builder_js(&g);
+        assert!(js.contains("\"to\":\"int32\""));
+    }
+
+    #[test]
+    fn test_emit_constant_node_uses_atob_decode() {
+        let mut g = new_graph_json();
+        let mut options = serde_json::Map::new();
+        options.insert("dataType".to_string(), serde_json::json!("Float32"));
+        options.insert("shape".to_string(), serde_json::json!([1]));
+        options.insert("data".to_string(), serde_json::json!("AAAAAA=="));
+        g.nodes.push(Node {
+            id: "c0".to_string(),
+            op: "constant".to_string(),
+            inputs: vec![],
+            options,
+            outputs: None,
+        });
+        g.outputs.insert("c0".to_string(), "c0".to_string());
+        let js = emit_builder_js(&g);
+        assert!(js.contains("atob(b64)"));
+        assert!(js.contains("dataType: \"float32\""));
+        assert!(js.contains("builder.constant"));
     }
 
     #[test]

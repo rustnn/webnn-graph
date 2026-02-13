@@ -2,7 +2,9 @@
 
 use crate::ast::Node;
 use crate::onnx::convert::{sanitize_identifier, OnnxError};
-use crate::onnx::ops::{ConversionContext, ConversionResult, OpHandler};
+use crate::onnx::ops::{
+    normalize_axis_best_effort, ConversionContext, ConversionResult, OpHandler,
+};
 use crate::protos::onnx::NodeProto;
 use serde_json::Map;
 
@@ -80,9 +82,11 @@ impl NormalizationHandler {
         let mut options = Map::new();
         options.insert("epsilon".to_string(), serde_json::json!(epsilon));
 
-        // WebNN layerNormalization uses axes parameter (array)
-        // Convert ONNX axis to axes array
-        if axis != -1 {
+        // WebNN layerNormalization uses positive axes.
+        if let Some(rank) = context.input_rank(inputs[0].as_str()) {
+            let normalized_axis = normalize_axis_best_effort(axis, rank);
+            options.insert("axes".to_string(), serde_json::json!([normalized_axis]));
+        } else if axis != -1 {
             options.insert("axes".to_string(), serde_json::json!([axis]));
         }
 
@@ -152,8 +156,13 @@ impl NormalizationHandler {
 
         let input0 = context.resolve_input(&inputs[0]);
 
+        let axis = if let Some(rank) = context.input_rank(inputs[0].as_str()) {
+            normalize_axis_best_effort(axis, rank)
+        } else {
+            axis
+        };
+
         let mut options = Map::new();
-        // WebNN softmax uses axis parameter (single value)
         options.insert("axis".to_string(), serde_json::json!(axis));
 
         let mut result = ConversionResult::new(vec![Node {
@@ -212,7 +221,8 @@ mod tests {
         let mut node = create_test_node("Softmax", vec!["x"], vec!["y"]);
         add_int_attribute(&mut node, "axis", -1);
         let initializers = std::collections::HashMap::new();
-        let value_shapes = std::collections::HashMap::new();
+        let mut value_shapes = std::collections::HashMap::new();
+        value_shapes.insert("x".to_string(), vec![1, 128, 384]);
         let const_values = std::collections::HashMap::new();
         let value_ids = std::collections::HashMap::new();
         let value_types = std::collections::HashMap::new();
@@ -231,14 +241,21 @@ mod tests {
         assert_eq!(result.nodes[0].inputs, vec!["x"]);
         assert_eq!(result.nodes[0].id, "y");
         assert!(result.nodes[0].options.contains_key("axis"));
+        assert_eq!(
+            result.nodes[0].options.get("axis"),
+            Some(&serde_json::json!(2))
+        );
     }
 
     #[test]
     fn test_convert_layer_norm() {
         let handler = NormalizationHandler;
-        let node = create_test_node("LayerNormalization", vec!["x", "scale", "bias"], vec!["y"]);
+        let mut node =
+            create_test_node("LayerNormalization", vec!["x", "scale", "bias"], vec!["y"]);
+        add_int_attribute(&mut node, "axis", -1);
         let initializers = std::collections::HashMap::new();
-        let value_shapes = std::collections::HashMap::new();
+        let mut value_shapes = std::collections::HashMap::new();
+        value_shapes.insert("x".to_string(), vec![1, 128, 384]);
         let const_values = std::collections::HashMap::new();
         let value_ids = std::collections::HashMap::new();
         let value_types = std::collections::HashMap::new();
@@ -256,5 +273,9 @@ mod tests {
         assert_eq!(result.nodes[0].op, "layerNormalization");
         assert_eq!(result.nodes[0].inputs.len(), 3);
         assert!(result.nodes[0].options.contains_key("epsilon"));
+        assert_eq!(
+            result.nodes[0].options.get("axes"),
+            Some(&serde_json::json!([2]))
+        );
     }
 }

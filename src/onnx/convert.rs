@@ -88,10 +88,7 @@ fn infer_shape(
             value_shapes.get(ins[0].as_str()).cloned()
         }
 
-        // Binary operations (with broadcasting) - prefer shape with FEWER dimensions
-        // This prevents shape inflation: constants remain compact, not broadcast-expanded
-        // Rationale: Broadcasting happens implicitly in WebNN ops; storing inflated shapes
-        // causes compatibility issues when converting back to ONNX
+        // Binary operations with NumPy-style broadcasting semantics.
         "Add" | "Sub" | "Mul" | "Div" | "Pow" => {
             let ins = node.input.as_slice();
             if ins.len() < 2 {
@@ -103,13 +100,21 @@ fn infer_shape(
 
             match (shape_a, shape_b) {
                 (Some(a), Some(b)) => {
-                    // Prefer the shape with FEWER dimensions to avoid shape inflation
-                    // Example: [129] + [1, 128, 1] → keep [129], not [1, 128, 129]
-                    if a.len() <= b.len() {
-                        Some(a.clone())
-                    } else {
-                        Some(b.clone())
+                    let rank = a.len().max(b.len());
+                    let mut out_rev = Vec::with_capacity(rank);
+                    for i in 0..rank {
+                        let da = a.get(a.len().wrapping_sub(1 + i)).copied().unwrap_or(1);
+                        let db = b.get(b.len().wrapping_sub(1 + i)).copied().unwrap_or(1);
+                        if da == db || da == 1 {
+                            out_rev.push(db);
+                        } else if db == 1 {
+                            out_rev.push(da);
+                        } else {
+                            return None;
+                        }
                     }
+                    out_rev.reverse();
+                    Some(out_rev)
                 }
                 (Some(a), None) => Some(a.clone()),
                 (None, Some(b)) => Some(b.clone()),
@@ -527,6 +532,144 @@ fn infer_shape(
     }
 }
 
+fn shape_numel(shape: &[i64]) -> Option<usize> {
+    shape.iter().try_fold(1usize, |acc, &d| {
+        if d < 0 {
+            return None;
+        }
+        usize::try_from(d).ok().map(|v| acc.saturating_mul(v))
+    })
+}
+
+fn const_shape_for_folding(
+    name: &str,
+    values: &[i64],
+    value_shapes: &HashMap<String, Vec<i64>>,
+) -> Vec<i64> {
+    if let Some(shape) = value_shapes.get(name) {
+        if shape_numel(shape) == Some(values.len()) {
+            return shape.clone();
+        }
+    }
+
+    if values.len() == 1 {
+        Vec::new()
+    } else {
+        vec![values.len() as i64]
+    }
+}
+
+fn broadcast_shape(shape_a: &[i64], shape_b: &[i64]) -> Option<Vec<i64>> {
+    let rank = shape_a.len().max(shape_b.len());
+    let mut out_rev = Vec::with_capacity(rank);
+    for i in 0..rank {
+        let da = shape_a
+            .get(shape_a.len().wrapping_sub(1 + i))
+            .copied()
+            .unwrap_or(1);
+        let db = shape_b
+            .get(shape_b.len().wrapping_sub(1 + i))
+            .copied()
+            .unwrap_or(1);
+        if da <= 0 || db <= 0 {
+            return None;
+        }
+        if da == db || da == 1 {
+            out_rev.push(db);
+        } else if db == 1 {
+            out_rev.push(da);
+        } else {
+            return None;
+        }
+    }
+    out_rev.reverse();
+    Some(out_rev)
+}
+
+fn linear_index_for_broadcast_operand(
+    out_linear_idx: usize,
+    out_shape: &[i64],
+    in_shape: &[i64],
+) -> Option<usize> {
+    if in_shape.is_empty() {
+        return Some(0);
+    }
+
+    let in_rank = in_shape.len();
+    let out_rank = out_shape.len();
+    if in_rank > out_rank {
+        return None;
+    }
+
+    let mut in_linear_idx = 0usize;
+    let mut in_stride = 1usize;
+    let mut rem = out_linear_idx;
+
+    for out_axis_rev in 0..out_rank {
+        let out_axis = out_rank - 1 - out_axis_rev;
+        let out_dim = usize::try_from(out_shape[out_axis]).ok()?;
+        if out_dim == 0 {
+            return None;
+        }
+        let out_coord = rem % out_dim;
+        rem /= out_dim;
+
+        if out_axis_rev < in_rank {
+            let in_axis = in_rank - 1 - out_axis_rev;
+            let in_dim = usize::try_from(in_shape[in_axis]).ok()?;
+            if in_dim == 0 {
+                return None;
+            }
+            let in_coord = if in_dim == 1 { 0 } else { out_coord };
+            in_linear_idx = in_linear_idx.saturating_add(in_coord.saturating_mul(in_stride));
+            in_stride = in_stride.saturating_mul(in_dim);
+        }
+    }
+
+    Some(in_linear_idx)
+}
+
+fn fold_binary_const_i64(
+    op_type: &str,
+    a_values: &[i64],
+    b_values: &[i64],
+    a_shape: &[i64],
+    b_shape: &[i64],
+) -> Option<(Vec<i64>, Vec<i64>)> {
+    let out_shape = broadcast_shape(a_shape, b_shape)?;
+    let out_numel = shape_numel(&out_shape)?;
+
+    let mut out_values = Vec::with_capacity(out_numel);
+    for out_idx in 0..out_numel {
+        let a_idx = linear_index_for_broadcast_operand(out_idx, &out_shape, a_shape)?;
+        let b_idx = linear_index_for_broadcast_operand(out_idx, &out_shape, b_shape)?;
+        let av = *a_values.get(a_idx)?;
+        let bv = *b_values.get(b_idx)?;
+        let v = match op_type {
+            "Add" => av + bv,
+            "Sub" => av - bv,
+            "Mul" => av * bv,
+            "Div" => {
+                if bv == 0 {
+                    return None;
+                }
+                av / bv
+            }
+            "Equal" => {
+                if av == bv {
+                    1
+                } else {
+                    0
+                }
+            }
+            _ => return None,
+        };
+        out_values.push(v);
+    }
+
+    Some((out_values, out_shape))
+}
+
 /// Conversion options for ONNX to WebNN
 #[derive(Debug, Clone)]
 pub struct ConvertOptions {
@@ -938,11 +1081,19 @@ Provide --override-dim {}=<value> or enable --experimental-dynamic-inputs.",
                     if let Some(TypeProtoValue::TensorType(tensor_type)) = &type_proto.value {
                         if let Some(shape_proto) = &tensor_type.shape {
                             let mut shape: Vec<i64> = Vec::new();
+                            let mut unknown = false;
                             for dim in &shape_proto.dim {
                                 if let Some(dim_value) = &dim.value {
                                     match dim_value {
                                         DimensionValue::DimValue(v) => {
-                                            shape.push(*v);
+                                            if *v > 0 {
+                                                shape.push(*v);
+                                            } else if options.experimental_dynamic_inputs {
+                                                shape.push(default_dynamic_max_size as i64);
+                                            } else {
+                                                unknown = true;
+                                                break;
+                                            }
                                         }
                                         DimensionValue::DimParam(dim_param) => {
                                             if let Some(v) = resolve_dim_for_inference(
@@ -950,12 +1101,22 @@ Provide --override-dim {}=<value> or enable --experimental-dynamic-inputs.",
                                                 &mut inference_overrides,
                                             ) {
                                                 shape.push(v as i64);
+                                            } else if options.experimental_dynamic_inputs {
+                                                shape.push(dynamic_max_for_dim(dim_param) as i64);
+                                            } else {
+                                                unknown = true;
+                                                break;
                                             }
                                         }
                                     }
+                                } else if options.experimental_dynamic_inputs {
+                                    shape.push(default_dynamic_max_size as i64);
+                                } else {
+                                    unknown = true;
+                                    break;
                                 }
                             }
-                            if !shape.is_empty() {
+                            if !unknown && !shape.is_empty() {
                                 value_shapes.insert(raw_name.clone(), shape.clone());
                                 value_shapes.insert(mapped_name.clone(), shape);
                             }
@@ -1028,7 +1189,14 @@ Provide --override-dim {}=<value> or enable --experimental-dynamic-inputs.",
                             if let Some(dim_value) = &dim.value {
                                 match dim_value {
                                     DimensionValue::DimValue(v) => {
-                                        shape.push(*v);
+                                        if *v > 0 {
+                                            shape.push(*v);
+                                        } else if options.experimental_dynamic_inputs {
+                                            shape.push(default_dynamic_max_size as i64);
+                                        } else {
+                                            unknown = true;
+                                            break;
+                                        }
                                     }
                                     DimensionValue::DimParam(dim_param) => {
                                         if let Some(v) = resolve_dim_for_inference(
@@ -1036,12 +1204,16 @@ Provide --override-dim {}=<value> or enable --experimental-dynamic-inputs.",
                                             &mut inference_overrides,
                                         ) {
                                             shape.push(v as i64);
+                                        } else if options.experimental_dynamic_inputs {
+                                            shape.push(dynamic_max_for_dim(dim_param) as i64);
                                         } else {
                                             unknown = true;
                                             break;
                                         }
                                     }
                                 }
+                            } else if options.experimental_dynamic_inputs {
+                                shape.push(default_dynamic_max_size as i64);
                             } else {
                                 unknown = true;
                                 break;
@@ -1170,42 +1342,68 @@ Provide --override-dim {}=<value> or enable --experimental-dynamic-inputs.",
 
         // Run the static shape/type inference scaffold to seed shapes/types/constants
         // before lowering. Errors surface early if dynamic dims remain.
-        match crate::onnx::shape_inference::infer_static_shapes(&self.model, &inference_overrides) {
-            Ok(inferred) => {
-                // Initial seeding: use or_insert since these are the first values
-                // (no prior shapes to override)
-                for (k, v) in inferred.value_shapes {
-                    value_shapes.entry(k).or_insert(v);
-                }
-                for (k, v) in inferred.value_types {
-                    value_types.entry(k).or_insert(v);
-                }
-                for (k, v) in inferred.const_values {
-                    // Use insert() instead of or_insert() to allow shape inference to correct
-                    // earlier wrong values (e.g., Where operation heuristics)
-                    if k.contains("rotary") && k.contains("Where") {
-                        if let Some(old_val) = const_values.get(&k) {
-                            crate::debug_println!(
-                                "[CONVERT] Overwriting {} from {:?} to {:?}",
-                                k,
-                                old_val,
-                                v
-                            );
-                        } else {
-                            crate::debug_println!("[CONVERT] Inserting new {} = {:?}", k, v);
-                        }
+        let mut dynamic_inference_attempts: HashSet<String> = HashSet::new();
+        loop {
+            match crate::onnx::shape_inference::infer_static_shapes(
+                &self.model,
+                &inference_overrides,
+            ) {
+                Ok(inferred) => {
+                    // Initial seeding: use or_insert since these are the first values
+                    // (no prior shapes to override)
+                    for (k, v) in inferred.value_shapes {
+                        value_shapes.entry(k).or_insert(v);
                     }
-                    const_values.insert(k, v);
+                    for (k, v) in inferred.value_types {
+                        value_types.entry(k).or_insert(v);
+                    }
+                    for (k, v) in inferred.const_values {
+                        // Use insert() instead of or_insert() to allow shape inference to correct
+                        // earlier wrong values (e.g., Where operation heuristics)
+                        if k.contains("rotary") && k.contains("Where") {
+                            if let Some(old_val) = const_values.get(&k) {
+                                crate::debug_println!(
+                                    "[CONVERT] Overwriting {} from {:?} to {:?}",
+                                    k,
+                                    old_val,
+                                    v
+                                );
+                            } else {
+                                crate::debug_println!("[CONVERT] Inserting new {} = {:?}", k, v);
+                            }
+                        }
+                        const_values.insert(k, v);
+                    }
+                    break;
                 }
-            }
-            Err(crate::onnx::shape_inference::ShapeInferenceError::DynamicDim { input, dim }) => {
-                crate::debug_println!(
-                    "[CONVERT] Skipping static shape inference due to unresolved dynamic dim '{}' on input '{}'",
+                Err(crate::onnx::shape_inference::ShapeInferenceError::DynamicDim {
+                    input,
                     dim,
-                    input
-                );
+                }) => {
+                    if options.experimental_dynamic_inputs
+                        && !dynamic_inference_attempts.contains(dim.as_str())
+                    {
+                        let fallback = dynamic_max_for_dim(&dim);
+                        inference_overrides.insert(dim.clone(), fallback);
+                        dynamic_inference_attempts.insert(dim.clone());
+                        crate::debug_println!(
+                            "[CONVERT] Retrying static shape inference with inferred override {}={} \
+                             (required by input '{}')",
+                            dim,
+                            fallback,
+                            input
+                        );
+                        continue;
+                    }
+                    crate::debug_println!(
+                        "[CONVERT] Skipping static shape inference due to unresolved dynamic dim '{}' on input '{}'",
+                        dim,
+                        input
+                    );
+                    break;
+                }
+                Err(e) => return Err(OnnxError::ShapeInference(e.to_string())),
             }
-            Err(e) => return Err(OnnxError::ShapeInference(e.to_string())),
         }
 
         // Propagate shapes and fold constant shape expressions in a few passes
@@ -1373,54 +1571,31 @@ Provide --override-dim {}=<value> or enable --experimental-dynamic-inputs.",
                     }
                 } else if matches!(op_type, "Add" | "Sub" | "Mul" | "Div") {
                     if node.input.as_slice().len() >= 2 {
-                        if let (Some(a), Some(b), Some(out)) = (
-                            node.input
-                                .as_slice()
-                                .first()
-                                .and_then(|i| const_values.get(i)),
-                            node.input
-                                .as_slice()
-                                .get(1)
-                                .and_then(|i| const_values.get(i)),
+                        if let (Some(a_name), Some(b_name), Some(out)) = (
+                            node.input.as_slice().first(),
+                            node.input.as_slice().get(1),
                             node.output.as_slice().first(),
                         ) {
-                            let mut result_vals = Vec::new();
-                            let (a_len, b_len) = (a.len(), b.len());
-                            let max_len = a_len.max(b_len);
-                            for idx in 0..max_len {
-                                let av = if a_len == 1 { a[0] } else { a[idx] };
-                                let bv = if b_len == 1 { b[0] } else { b[idx] };
-                                let v = match op_type {
-                                    "Add" => av + bv,
-                                    "Sub" => av - bv,
-                                    "Mul" => av * bv,
-                                    "Div" => {
-                                        if bv == 0 {
-                                            continue;
-                                        }
-                                        av / bv
-                                    }
-                                    _ => unreachable!(),
-                                };
-                                result_vals.push(v);
-                            }
-                            if !result_vals.is_empty() {
-                                const_values.insert(out.to_string(), result_vals.clone());
-                                let out_shape = if result_vals.len() == 1 {
-                                    Vec::new()
-                                } else {
-                                    vec![result_vals.len() as i64]
-                                };
-                                // Force the correct shape - Binary operations compute exact output shape
-                                value_shapes.insert(out.to_string(), out_shape.clone());
-                                value_shapes.insert(sanitize_identifier(out), out_shape);
-                                if let Some(dtype) = node
-                                    .input
-                                    .as_slice()
-                                    .iter()
-                                    .find_map(|i| value_types.get(i).cloned())
+                            let a = const_values.get(a_name);
+                            let b = const_values.get(b_name);
+                            if let (Some(a), Some(b)) = (a, b) {
+                                let a_shape = const_shape_for_folding(a_name, a, &value_shapes);
+                                let b_shape = const_shape_for_folding(b_name, b, &value_shapes);
+                                if let Some((result_vals, out_shape)) =
+                                    fold_binary_const_i64(op_type, a, b, &a_shape, &b_shape)
                                 {
-                                    value_types.insert(out.to_string(), dtype);
+                                    const_values.insert(out.to_string(), result_vals.clone());
+                                    // Force the correct shape - Binary operations compute exact output shape
+                                    value_shapes.insert(out.to_string(), out_shape.clone());
+                                    value_shapes.insert(sanitize_identifier(out), out_shape);
+                                    if let Some(dtype) = node
+                                        .input
+                                        .as_slice()
+                                        .iter()
+                                        .find_map(|i| value_types.get(i).cloned())
+                                    {
+                                        value_types.insert(out.to_string(), dtype);
+                                    }
                                 }
                             }
                         }
@@ -1583,44 +1758,25 @@ Provide --override-dim {}=<value> or enable --experimental-dynamic-inputs.",
                 } else if op_type == "Equal" {
                     // Equal(a, b) -> boolean tensor (represented as i64: 1 for true, 0 for false)
                     if node.input.as_slice().len() >= 2 {
-                        if let (Some(a), Some(b), Some(out)) = (
-                            node.input
-                                .as_slice()
-                                .first()
-                                .and_then(|i| const_values.get(i)),
-                            node.input
-                                .as_slice()
-                                .get(1)
-                                .and_then(|i| const_values.get(i)),
+                        if let (Some(a_name), Some(b_name), Some(out)) = (
+                            node.input.as_slice().first(),
+                            node.input.as_slice().get(1),
                             node.output.as_slice().first(),
                         ) {
-                            let mut result_vals = Vec::new();
-                            let (a_len, b_len) = (a.len(), b.len());
-                            let max_len = a_len.max(b_len);
-                            for idx in 0..max_len {
-                                let av = if a_len == 1 {
-                                    a[0]
-                                } else {
-                                    a.get(idx).copied().unwrap_or(0)
-                                };
-                                let bv = if b_len == 1 {
-                                    b[0]
-                                } else {
-                                    b.get(idx).copied().unwrap_or(0)
-                                };
-                                result_vals.push(if av == bv { 1 } else { 0 });
-                            }
-                            if !result_vals.is_empty() {
-                                const_values.insert(out.to_string(), result_vals.clone());
-                                let out_shape = if result_vals.len() == 1 {
-                                    Vec::new()
-                                } else {
-                                    vec![result_vals.len() as i64]
-                                };
-                                // Force the correct shape - Equal operation computes exact output shape
-                                value_shapes.insert(out.to_string(), out_shape.clone());
-                                value_shapes.insert(sanitize_identifier(out), out_shape);
-                                value_types.insert(out.to_string(), DataType::Int64);
+                            let a = const_values.get(a_name);
+                            let b = const_values.get(b_name);
+                            if let (Some(a), Some(b)) = (a, b) {
+                                let a_shape = const_shape_for_folding(a_name, a, &value_shapes);
+                                let b_shape = const_shape_for_folding(b_name, b, &value_shapes);
+                                if let Some((result_vals, out_shape)) =
+                                    fold_binary_const_i64("Equal", a, b, &a_shape, &b_shape)
+                                {
+                                    const_values.insert(out.to_string(), result_vals.clone());
+                                    // Force the correct shape - Equal operation computes exact output shape
+                                    value_shapes.insert(out.to_string(), out_shape.clone());
+                                    value_shapes.insert(sanitize_identifier(out), out_shape);
+                                    value_types.insert(out.to_string(), DataType::Int64);
+                                }
                             }
                         }
                     }
@@ -1645,7 +1801,6 @@ Provide --override-dim {}=<value> or enable --experimental-dynamic-inputs.",
         if let Some(val) = const_values.get("/model/rotary_emb/Where_output_0") {
             crate::debug_println!("[NODE CONV] /model/rotary_emb/Where_output_0 = {:?}", val);
         }
-
         for onnx_node in onnx_graph.node.as_slice() {
             // If all outputs are compile-time constants, emit them directly and skip conversion
             let outputs = onnx_node.output.as_slice();
@@ -2268,5 +2423,447 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("override-dim"));
         assert!(msg.contains("experimental-dynamic-inputs"));
+    }
+
+    #[test]
+    fn test_convert_dynamic_shape_concat_reshape_path_with_experimental_flag() {
+        use crate::protos::onnx::{tensor_shape_proto, type_proto};
+        use crate::protos::onnx::{
+            AttributeProto, GraphProto, ModelProto, NodeProto, TensorProto, TensorShapeProto,
+            ValueInfoProto,
+        };
+
+        let batch_dim = tensor_shape_proto::Dimension {
+            value: Some(tensor_shape_proto::dimension::Value::DimValue(1)),
+            denotation: String::new(),
+        };
+        let seq_dim = tensor_shape_proto::Dimension {
+            value: Some(tensor_shape_proto::dimension::Value::DimParam(
+                "sequence_length".to_string(),
+            )),
+            denotation: String::new(),
+        };
+        let hidden_dim = tensor_shape_proto::Dimension {
+            value: Some(tensor_shape_proto::dimension::Value::DimValue(4)),
+            denotation: String::new(),
+        };
+        let data_shape = TensorShapeProto {
+            dim: vec![batch_dim, seq_dim, hidden_dim],
+        };
+
+        let data_tensor_type = type_proto::Tensor {
+            elem_type: TensorProto_DataType::Float.into(),
+            shape: Some(data_shape),
+        };
+        let data_type_proto = crate::protos::onnx::TypeProto {
+            value: Some(type_proto::Value::TensorType(data_tensor_type)),
+            denotation: String::new(),
+        };
+
+        let data_input = ValueInfoProto {
+            name: "data".to_string(),
+            r#type: Some(data_type_proto.clone()),
+            ..Default::default()
+        };
+        let data_output = ValueInfoProto {
+            name: "out".to_string(),
+            r#type: Some(data_type_proto),
+            ..Default::default()
+        };
+
+        let idx0 = TensorProto {
+            name: "idx0".to_string(),
+            data_type: TensorProto_DataType::Int64 as i32,
+            dims: vec![1],
+            int64_data: vec![0],
+            ..Default::default()
+        };
+        let idx1 = TensorProto {
+            name: "idx1".to_string(),
+            data_type: TensorProto_DataType::Int64 as i32,
+            dims: vec![1],
+            int64_data: vec![1],
+            ..Default::default()
+        };
+        let last_dim = TensorProto {
+            name: "last_dim".to_string(),
+            data_type: TensorProto_DataType::Int64 as i32,
+            dims: vec![1],
+            int64_data: vec![4],
+            ..Default::default()
+        };
+
+        let shape_node = NodeProto {
+            op_type: "Shape".to_string(),
+            input: vec!["data".to_string()],
+            output: vec!["shape_out".to_string()],
+            ..Default::default()
+        };
+        let gather0 = NodeProto {
+            op_type: "Gather".to_string(),
+            input: vec!["shape_out".to_string(), "idx0".to_string()],
+            output: vec!["dim0".to_string()],
+            attribute: vec![AttributeProto {
+                name: "axis".to_string(),
+                i: 0,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let gather1 = NodeProto {
+            op_type: "Gather".to_string(),
+            input: vec!["shape_out".to_string(), "idx1".to_string()],
+            output: vec!["dim1".to_string()],
+            attribute: vec![AttributeProto {
+                name: "axis".to_string(),
+                i: 0,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let concat_shape = NodeProto {
+            op_type: "Concat".to_string(),
+            input: vec![
+                "dim0".to_string(),
+                "dim1".to_string(),
+                "last_dim".to_string(),
+            ],
+            output: vec!["shape_for_reshape".to_string()],
+            attribute: vec![AttributeProto {
+                name: "axis".to_string(),
+                i: 0,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let reshape = NodeProto {
+            op_type: "Reshape".to_string(),
+            input: vec!["data".to_string(), "shape_for_reshape".to_string()],
+            output: vec!["out".to_string()],
+            ..Default::default()
+        };
+
+        let model = ModelProto {
+            graph: Some(GraphProto {
+                input: vec![data_input],
+                output: vec![data_output],
+                initializer: vec![idx0, idx1, last_dim],
+                node: vec![shape_node, gather0, gather1, concat_shape, reshape],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let converter = OnnxConverter::new(model).expect("converter");
+        let graph = converter
+            .convert(&ConvertOptions {
+                optimize: true,
+                experimental_dynamic_inputs: true,
+                extract_weights: false,
+                ..ConvertOptions::default()
+            })
+            .expect("dynamic reshape path should convert");
+
+        let reshape_node = graph
+            .nodes
+            .iter()
+            .find(|n| n.op == "reshape")
+            .expect("reshape node should exist");
+        let shape = reshape_node
+            .options
+            .get("newShape")
+            .and_then(|v| v.as_array())
+            .expect("newShape should be an array");
+        assert_eq!(shape.len(), 3);
+        assert_eq!(shape[0].as_u64(), Some(1));
+        assert_eq!(shape[2].as_u64(), Some(4));
+        assert!(
+            shape[1].as_u64().is_some_and(|v| v > 0),
+            "sequence dimension should be concretized for lowering"
+        );
+    }
+
+    #[test]
+    fn test_convert_reshape_shape_path_survives_add_broadcast() {
+        use crate::protos::onnx::{tensor_shape_proto, type_proto};
+        use crate::protos::onnx::{
+            AttributeProto, GraphProto, ModelProto, NodeProto, TensorProto, TensorShapeProto,
+            ValueInfoProto,
+        };
+
+        let batch_dim = tensor_shape_proto::Dimension {
+            value: Some(tensor_shape_proto::dimension::Value::DimValue(1)),
+            denotation: String::new(),
+        };
+        let seq_dim = tensor_shape_proto::Dimension {
+            value: Some(tensor_shape_proto::dimension::Value::DimValue(128)),
+            denotation: String::new(),
+        };
+        let hidden_dim = tensor_shape_proto::Dimension {
+            value: Some(tensor_shape_proto::dimension::Value::DimValue(4)),
+            denotation: String::new(),
+        };
+        let data_shape = TensorShapeProto {
+            dim: vec![batch_dim, seq_dim, hidden_dim],
+        };
+
+        let data_tensor_type = type_proto::Tensor {
+            elem_type: TensorProto_DataType::Float.into(),
+            shape: Some(data_shape),
+        };
+        let data_type_proto = crate::protos::onnx::TypeProto {
+            value: Some(type_proto::Value::TensorType(data_tensor_type)),
+            denotation: String::new(),
+        };
+
+        let data_input = ValueInfoProto {
+            name: "data".to_string(),
+            r#type: Some(data_type_proto.clone()),
+            ..Default::default()
+        };
+        let data_output = ValueInfoProto {
+            name: "out".to_string(),
+            r#type: Some(data_type_proto),
+            ..Default::default()
+        };
+
+        let bias = TensorProto {
+            name: "bias".to_string(),
+            data_type: TensorProto_DataType::Float as i32,
+            dims: vec![4],
+            float_data: vec![0.0, 0.0, 0.0, 0.0],
+            ..Default::default()
+        };
+        let idx0 = TensorProto {
+            name: "idx0".to_string(),
+            data_type: TensorProto_DataType::Int64 as i32,
+            dims: vec![1],
+            int64_data: vec![0],
+            ..Default::default()
+        };
+        let idx1 = TensorProto {
+            name: "idx1".to_string(),
+            data_type: TensorProto_DataType::Int64 as i32,
+            dims: vec![1],
+            int64_data: vec![1],
+            ..Default::default()
+        };
+        let last_dim = TensorProto {
+            name: "last_dim".to_string(),
+            data_type: TensorProto_DataType::Int64 as i32,
+            dims: vec![1],
+            int64_data: vec![4],
+            ..Default::default()
+        };
+
+        let add_node = NodeProto {
+            op_type: "Add".to_string(),
+            input: vec!["data".to_string(), "bias".to_string()],
+            output: vec!["add_out".to_string()],
+            ..Default::default()
+        };
+        let shape_node = NodeProto {
+            op_type: "Shape".to_string(),
+            input: vec!["add_out".to_string()],
+            output: vec!["shape_out".to_string()],
+            ..Default::default()
+        };
+        let gather0 = NodeProto {
+            op_type: "Gather".to_string(),
+            input: vec!["shape_out".to_string(), "idx0".to_string()],
+            output: vec!["dim0".to_string()],
+            attribute: vec![AttributeProto {
+                name: "axis".to_string(),
+                i: 0,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let gather1 = NodeProto {
+            op_type: "Gather".to_string(),
+            input: vec!["shape_out".to_string(), "idx1".to_string()],
+            output: vec!["dim1".to_string()],
+            attribute: vec![AttributeProto {
+                name: "axis".to_string(),
+                i: 0,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let concat_shape = NodeProto {
+            op_type: "Concat".to_string(),
+            input: vec![
+                "dim0".to_string(),
+                "dim1".to_string(),
+                "last_dim".to_string(),
+            ],
+            output: vec!["shape_for_reshape".to_string()],
+            attribute: vec![AttributeProto {
+                name: "axis".to_string(),
+                i: 0,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let reshape = NodeProto {
+            op_type: "Reshape".to_string(),
+            input: vec!["add_out".to_string(), "shape_for_reshape".to_string()],
+            output: vec!["out".to_string()],
+            ..Default::default()
+        };
+
+        let model = ModelProto {
+            graph: Some(GraphProto {
+                input: vec![data_input],
+                output: vec![data_output],
+                initializer: vec![bias, idx0, idx1, last_dim],
+                node: vec![
+                    add_node,
+                    shape_node,
+                    gather0,
+                    gather1,
+                    concat_shape,
+                    reshape,
+                ],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let converter = OnnxConverter::new(model).expect("converter");
+        let graph = converter
+            .convert(&ConvertOptions {
+                optimize: true,
+                extract_weights: false,
+                ..ConvertOptions::default()
+            })
+            .expect("broadcasted shape path should convert");
+
+        let reshape_node = graph
+            .nodes
+            .iter()
+            .find(|n| n.op == "reshape")
+            .expect("reshape node should exist");
+        assert_eq!(
+            reshape_node.options.get("newShape"),
+            Some(&serde_json::json!([1, 128, 4]))
+        );
+    }
+
+    #[test]
+    fn test_binary_const_folding_preserves_broadcast_shape() {
+        let a = vec![-1];
+        let b = vec![1, 2, 3, 4].repeat(128);
+        let a_shape = Vec::<i64>::new();
+        let b_shape = vec![1, 128, 4];
+        let (out, out_shape) =
+            fold_binary_const_i64("Mul", &a, &b, &a_shape, &b_shape).expect("broadcast fold");
+        assert_eq!(out_shape, vec![1, 128, 4]);
+        assert_eq!(out.len(), 512);
+        assert_eq!(out[0], -1);
+        assert_eq!(out[1], -2);
+        assert_eq!(out[2], -3);
+        assert_eq!(out[3], -4);
+    }
+
+    #[test]
+    fn test_convert_equal_broadcast_path_does_not_flatten_const_shape() {
+        use crate::protos::onnx::{
+            type_proto, AttributeProto, GraphProto, ModelProto, NodeProto, TensorProto,
+        };
+
+        let a = TensorProto {
+            name: "shape_vec".to_string(),
+            data_type: TensorProto_DataType::Int64 as i32,
+            dims: vec![4],
+            int64_data: vec![1, 128, 4, 8],
+            ..Default::default()
+        };
+        let shape3 = TensorProto {
+            name: "shape3".to_string(),
+            data_type: TensorProto_DataType::Int64 as i32,
+            dims: vec![3],
+            int64_data: vec![1, 128, 4],
+            ..Default::default()
+        };
+        let neg1 = TensorProto {
+            name: "neg1".to_string(),
+            data_type: TensorProto_DataType::Int64 as i32,
+            dims: vec![],
+            int64_data: vec![-1],
+            ..Default::default()
+        };
+        let cos_fill = TensorProto {
+            data_type: TensorProto_DataType::Int64 as i32,
+            dims: vec![],
+            int64_data: vec![1],
+            ..Default::default()
+        };
+
+        let cos = NodeProto {
+            op_type: "ConstantOfShape".to_string(),
+            input: vec!["shape3".to_string()],
+            output: vec!["cos_out".to_string()],
+            attribute: vec![AttributeProto {
+                name: "value".to_string(),
+                t: Some(cos_fill),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let mul = NodeProto {
+            op_type: "Mul".to_string(),
+            input: vec!["cos_out".to_string(), "neg1".to_string()],
+            output: vec!["mul_out".to_string()],
+            ..Default::default()
+        };
+        let eq = NodeProto {
+            op_type: "Equal".to_string(),
+            input: vec!["shape_vec".to_string(), "mul_out".to_string()],
+            output: vec!["eq_out".to_string()],
+            ..Default::default()
+        };
+
+        let output_type = crate::protos::onnx::TypeProto {
+            value: Some(type_proto::Value::TensorType(type_proto::Tensor {
+                elem_type: TensorProto_DataType::Bool.into(),
+                shape: None,
+            })),
+            denotation: String::new(),
+        };
+
+        let model = ModelProto {
+            graph: Some(GraphProto {
+                initializer: vec![a, shape3, neg1],
+                node: vec![cos, mul, eq],
+                output: vec![crate::protos::onnx::ValueInfoProto {
+                    name: "eq_out".to_string(),
+                    r#type: Some(output_type),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let converter = OnnxConverter::new(model).expect("converter");
+        let graph = converter
+            .convert(&ConvertOptions {
+                optimize: true,
+                extract_weights: false,
+                ..ConvertOptions::default()
+            })
+            .expect("convert");
+
+        let mul_const = graph.consts.get("mul_out").expect("mul_out const");
+        assert_eq!(mul_const.shape, vec![1, 128, 4]);
+        assert!(
+            graph.consts.get("eq_out").is_none()
+                || graph
+                    .consts
+                    .get("eq_out")
+                    .is_some_and(|decl| decl.shape == vec![1, 128, 4]),
+            "eq_out constant must not be flattened"
+        );
     }
 }
