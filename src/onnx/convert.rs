@@ -2068,23 +2068,25 @@ pub fn convert_onnx<P: AsRef<Path>>(
     converter.extract_metadata()?;
 
     // Convert to GraphJson
-    let graph = converter.convert(&options)?;
+    let mut graph = converter.convert(&options)?;
 
     // Extract weights if requested
     if options.extract_weights {
         if let (Some(weights_path), Some(manifest_path)) =
             (&options.weights_path, &options.manifest_path)
         {
-            extract_weights_from_onnx(&model, weights_path, manifest_path)?;
+            extract_weights_from_onnx(&model, &mut graph, weights_path, manifest_path)?;
         }
     }
 
     Ok(graph)
 }
 
-/// Extract weights from ONNX model to .weights and .manifest.json files
+/// Extract weights from ONNX model to .weights and .manifest.json files.
+/// Also extracts large inline constants from the converted graph into the weights file.
 fn extract_weights_from_onnx(
     model: &ModelProto,
+    graph: &mut GraphJson,
     weights_path: &str,
     manifest_path: &str,
 ) -> Result<(), OnnxError> {
@@ -2169,6 +2171,39 @@ fn extract_weights_from_onnx(
         // Append to weights data
         weights_data.extend_from_slice(&bytes_to_write);
         current_offset += byte_length;
+    }
+
+    // Extract large inline constants from the graph into the weights file.
+    // Threshold: constants larger than 1 KiB are moved to external weights.
+    const INLINE_THRESHOLD: usize = 1024;
+    for (name, decl) in graph.consts.iter_mut() {
+        if let crate::ast::ConstInit::InlineBytes { bytes } = &decl.init {
+            if bytes.len() > INLINE_THRESHOLD && !manifest.tensors.contains_key(name) {
+                let byte_length = bytes.len() as u64;
+                manifest.tensors.insert(
+                    name.clone(),
+                    TensorEntry {
+                        data_type: decl.data_type.clone(),
+                        shape: decl.shape.clone(),
+                        byte_offset: current_offset,
+                        byte_length,
+                        layout: None,
+                    },
+                );
+                weights_data.extend_from_slice(bytes);
+                current_offset += byte_length;
+            }
+        }
+    }
+    // Update the graph consts to use weight references instead of inline bytes
+    for (name, decl) in graph.consts.iter_mut() {
+        if let crate::ast::ConstInit::InlineBytes { bytes } = &decl.init {
+            if bytes.len() > INLINE_THRESHOLD {
+                decl.init = crate::ast::ConstInit::Weights {
+                    r#ref: name.clone(),
+                };
+            }
+        }
     }
 
     // Write weights file
