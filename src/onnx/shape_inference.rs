@@ -392,13 +392,21 @@ fn infer_node_shape(node: &NodeProto, ctx: &InferenceResult) -> Option<Vec<i64>>
                 return None;
             }
             let input_shape = ctx.value_shapes.get(node.input.as_slice()[0].as_str())?;
-            let axes = node
+            let mut axes = node
                 .attribute
                 .as_slice()
                 .iter()
                 .find(|a| a.name.as_str() == "axes")
                 .map(|a| a.ints.clone())
                 .unwrap_or_default();
+            // Opset >= 13: axes is a second input tensor, not an attribute
+            if axes.is_empty() && node.input.as_slice().len() > 1 {
+                axes = ctx
+                    .const_values
+                    .get(node.input.as_slice()[1].as_str())
+                    .cloned()
+                    .unwrap_or_default();
+            }
             if axes.is_empty() {
                 return None;
             }
@@ -422,24 +430,42 @@ fn infer_node_shape(node: &NodeProto, ctx: &InferenceResult) -> Option<Vec<i64>>
             if node.input.as_slice().len() < 2 {
                 return None;
             }
-            let target_shape = ctx.const_values.get(node.input.as_slice()[1].as_str())?;
-            if target_shape.is_empty() {
-                return None;
+            // Primary: use the shape tensor from const_values
+            if let Some(target_shape) = ctx.const_values.get(node.input.as_slice()[1].as_str()) {
+                if !target_shape.is_empty() {
+                    return Some(target_shape.clone());
+                }
             }
-            Some(target_shape.clone())
+            // Fallback: use the output shape if already known (e.g. from ONNX value_info)
+            if let Some(out) = node.output.as_slice().first() {
+                if let Some(shape) = ctx.value_shapes.get(out.as_str()) {
+                    if !shape.is_empty() && shape.iter().all(|&d| d > 0) {
+                        return Some(shape.clone());
+                    }
+                }
+            }
+            None
         }
         "Squeeze" => {
             if node.input.as_slice().is_empty() {
                 return None;
             }
             let input_shape = ctx.value_shapes.get(node.input.as_slice()[0].as_str())?;
-            let axes = node
+            let mut axes = node
                 .attribute
                 .as_slice()
                 .iter()
                 .find(|a| a.name.as_str() == "axes")
                 .map(|a| a.ints.clone())
                 .unwrap_or_default();
+            // Opset >= 13: axes is a second input tensor, not an attribute
+            if axes.is_empty() && node.input.as_slice().len() > 1 {
+                axes = ctx
+                    .const_values
+                    .get(node.input.as_slice()[1].as_str())
+                    .cloned()
+                    .unwrap_or_default();
+            }
             let mut output_shape = input_shape.clone();
             if axes.is_empty() {
                 output_shape.retain(|&d| d != 1);
@@ -837,6 +863,111 @@ fn fold_integer_constants(graph: &GraphProto, ctx: &mut InferenceResult) -> bool
                     .insert(out_name.clone(), data.unwrap_or_default());
                 ctx.value_shapes.insert(out_name, out_shape);
                 changed = true;
+            }
+            "Reshape" => {
+                if inputs.len() < 2 {
+                    continue;
+                }
+                let data = ctx.const_values.get(inputs[0].as_str()).cloned();
+                let shape_target = ctx.const_values.get(inputs[1].as_str()).cloned();
+                if let (Some(data), Some(mut target)) = (data, shape_target) {
+                    // Resolve -1 dimension
+                    if target.contains(&-1) {
+                        let total: i64 = if data.is_empty() {
+                            1
+                        } else {
+                            data.len() as i64
+                        };
+                        let known: i64 = target.iter().filter(|&&d| d != -1).product();
+                        if known != 0 {
+                            if let Some(idx) = target.iter().position(|&d| d == -1) {
+                                target[idx] = total / known;
+                            }
+                        }
+                    }
+                    let out_name = outputs[0].to_string();
+                    let out_shape = target.clone();
+                    ctx.const_values.insert(out_name.clone(), data);
+                    ctx.value_shapes.insert(out_name, out_shape);
+                    changed = true;
+                }
+            }
+            "ConstantOfShape" => {
+                // ConstantOfShape takes a 1D shape tensor and produces a tensor
+                // filled with a constant value (default 0.0f, or from 'value' attr)
+                if inputs.is_empty() {
+                    continue;
+                }
+                if let Some(shape_vals) = ctx.const_values.get(inputs[0].as_str()).cloned() {
+                    // Get the fill value from the 'value' attribute (default 0)
+                    let fill_value: i64 = node
+                        .attribute
+                        .as_slice()
+                        .iter()
+                        .find(|a| a.name.as_str() == "value")
+                        .and_then(|a| {
+                            let t = a.t.as_ref()?;
+                            if !t.raw_data.as_slice().is_empty() {
+                                // Try int64 first, then float
+                                if t.data_type == 7 && t.raw_data.as_slice().len() >= 8 {
+                                    let bytes = t.raw_data.as_slice();
+                                    Some(i64::from_le_bytes([
+                                        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5],
+                                        bytes[6], bytes[7],
+                                    ]))
+                                } else if t.data_type == 1 && t.raw_data.as_slice().len() >= 4 {
+                                    let bytes = t.raw_data.as_slice();
+                                    Some(f32::from_le_bytes([
+                                        bytes[0], bytes[1], bytes[2], bytes[3],
+                                    ]) as i64)
+                                } else {
+                                    Some(0)
+                                }
+                            } else if !t.int64_data.as_slice().is_empty() {
+                                Some(t.int64_data.as_slice()[0])
+                            } else if !t.float_data.as_slice().is_empty() {
+                                Some(t.float_data.as_slice()[0] as i64)
+                            } else {
+                                Some(0)
+                            }
+                        })
+                        .unwrap_or(0);
+
+                    let total: usize = shape_vals.iter().map(|&d| d.max(0) as usize).product();
+                    let data = vec![fill_value; total];
+                    let out_name = outputs[0].to_string();
+                    ctx.const_values.insert(out_name.clone(), data);
+                    ctx.value_shapes.insert(out_name, shape_vals);
+                    changed = true;
+                }
+            }
+            "Mul" => {
+                if inputs.len() < 2 {
+                    continue;
+                }
+                let lhs = ctx.const_values.get(inputs[0].as_str()).cloned();
+                let rhs = ctx.const_values.get(inputs[1].as_str()).cloned();
+                if let (Some(lhs), Some(rhs)) = (lhs, rhs) {
+                    // Handle scalar * tensor broadcasting
+                    let values: Vec<i64> = if lhs.len() == 1 && rhs.len() > 1 {
+                        rhs.iter().map(|&r| lhs[0] * r).collect()
+                    } else if rhs.len() == 1 && lhs.len() > 1 {
+                        lhs.iter().map(|&l| l * rhs[0]).collect()
+                    } else if lhs.len() == rhs.len() {
+                        lhs.iter().zip(rhs.iter()).map(|(&l, &r)| l * r).collect()
+                    } else {
+                        continue;
+                    };
+                    let out_name = outputs[0].to_string();
+                    let shape = if values.len() == 1 {
+                        Vec::new()
+                    } else {
+                        vec![values.len() as i64]
+                    };
+                    ctx.const_values.insert(out_name.clone(), values);
+                    ctx.value_shapes.insert(out_name, shape);
+                    changed = true;
+                }
             }
             "Equal" => {
                 if inputs.len() < 2 {
