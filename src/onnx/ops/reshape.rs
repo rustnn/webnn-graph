@@ -56,6 +56,26 @@ impl OpHandler for ReshapeHandler {
 }
 
 impl ReshapeHandler {
+    fn normalize_unsqueeze_axes_best_effort(&self, axes: &[i64], input_rank: usize) -> Vec<i64> {
+        // ONNX Unsqueeze interprets negative axes against the output rank.
+        let output_rank = input_rank.saturating_add(axes.len());
+        let output_rank_i64 = output_rank as i64;
+        axes.iter()
+            .map(|&axis| {
+                let normalized = if axis < 0 {
+                    axis + output_rank_i64
+                } else {
+                    axis
+                };
+                if normalized < 0 || normalized >= output_rank_i64 {
+                    axis
+                } else {
+                    normalized
+                }
+            })
+            .collect()
+    }
+
     fn read_axes_from_attr_or_const(
         &self,
         node: &NodeProto,
@@ -470,7 +490,64 @@ impl ReshapeHandler {
         }
 
         let mut options = Map::new();
-        options.insert("newShape".to_string(), serde_json::json!(shape_values));
+        let dynamic_shape_json =
+            |dims: &[crate::ast::Dimension]| -> Option<Vec<serde_json::Value>> {
+                if !dims
+                    .iter()
+                    .any(|d| matches!(d, crate::ast::Dimension::Dynamic(_)))
+                {
+                    return None;
+                }
+                if dims.len() != shape_values.len() {
+                    return None;
+                }
+                Some(
+                    dims.iter()
+                        .zip(shape_values.iter())
+                        .map(|(d, &sv)| match d {
+                            crate::ast::Dimension::Dynamic(dd) => serde_json::json!({
+                                "name": dd.name,
+                                "maxSize": dd.max_size
+                            }),
+                            crate::ast::Dimension::Static(_) => serde_json::json!(sv),
+                        })
+                        .collect(),
+                )
+            };
+        // Prefer dynamic metadata attached to the reshape output. Some ONNX exports
+        // keep a static shape tensor (e.g. [4096, 1]) while value_info correctly
+        // marks the output as [sequence_length, 1].
+        let dynamic_new_shape: Option<Vec<serde_json::Value>> = node
+            .output
+            .as_slice()
+            .first()
+            .and_then(|out| {
+                let out_s = out.to_string();
+                context
+                    .value_shape_dims
+                    .get(&out_s)
+                    .or_else(|| context.value_shape_dims.get(&sanitize_identifier(&out_s)))
+                    .or_else(|| context.value_shape_dims.get(out_s.trim_start_matches('/')))
+                    .and_then(|dims| dynamic_shape_json(dims))
+            })
+            .or_else(|| {
+                // Fall back to dynamic metadata on the shape tensor when available.
+                let shape_dims_key = shape_input_raw.clone();
+                context
+                    .value_shape_dims
+                    .get(&shape_dims_key)
+                    .or_else(|| {
+                        context
+                            .value_shape_dims
+                            .get(&sanitize_identifier(&shape_dims_key))
+                    })
+                    .and_then(|dims| dynamic_shape_json(dims))
+            });
+        if let Some(dyn_shape) = dynamic_new_shape {
+            options.insert("newShape".to_string(), serde_json::json!(dyn_shape));
+        } else {
+            options.insert("newShape".to_string(), serde_json::json!(shape_values));
+        }
 
         let mut result = ConversionResult::new(vec![Node {
             id: output_name.clone(),
@@ -581,21 +658,51 @@ impl ReshapeHandler {
             Vec::new()
         };
 
-        let mut dynamic_shape_json: Option<Vec<serde_json::Value>> = None;
+        let output_dim_shape = node
+            .output
+            .as_slice()
+            .first()
+            .and_then(|out| {
+                let out_s = out.to_string();
+                context
+                    .value_shape_dims
+                    .get(&out_s)
+                    .or_else(|| context.value_shape_dims.get(&sanitize_identifier(&out_s)))
+                    .or_else(|| context.value_shape_dims.get(out_s.trim_start_matches('/')))
+            })
+            .cloned();
+
+        let mut dynamic_shape_json: Option<Vec<serde_json::Value>> =
+            output_dim_shape.as_ref().and_then(|dims| {
+                if !dims
+                    .iter()
+                    .any(|d| matches!(d, crate::ast::Dimension::Dynamic(_)))
+                {
+                    return None;
+                }
+                if !shape_values.is_empty() && dims.len() != shape_values.len() {
+                    return None;
+                }
+                Some(
+                    dims.iter()
+                        .enumerate()
+                        .map(|(idx, d)| match d {
+                            crate::ast::Dimension::Static(v) => {
+                                if shape_values.is_empty() {
+                                    serde_json::json!(v)
+                                } else {
+                                    serde_json::json!(shape_values[idx] as u32)
+                                }
+                            }
+                            crate::ast::Dimension::Dynamic(dd) => serde_json::json!({
+                                "name": dd.name,
+                                "maxSize": dd.max_size
+                            }),
+                        })
+                        .collect(),
+                )
+            });
         let shape_values: Vec<i64> = if shape_values.is_empty() {
-            let output_dim_shape = node
-                .output
-                .as_slice()
-                .first()
-                .and_then(|out| {
-                    let out_s = out.to_string();
-                    context
-                        .value_shape_dims
-                        .get(&out_s)
-                        .or_else(|| context.value_shape_dims.get(&sanitize_identifier(&out_s)))
-                        .or_else(|| context.value_shape_dims.get(out_s.trim_start_matches('/')))
-                })
-                .cloned();
             let output_shape_opt = node
                 .output
                 .as_slice()
@@ -632,20 +739,7 @@ impl ReshapeHandler {
             shape_values
         };
 
-        if shape_values.is_empty() {
-            let output_dim_shape = node
-                .output
-                .as_slice()
-                .first()
-                .and_then(|out| {
-                    let out_s = out.to_string();
-                    context
-                        .value_shape_dims
-                        .get(&out_s)
-                        .or_else(|| context.value_shape_dims.get(&sanitize_identifier(&out_s)))
-                        .or_else(|| context.value_shape_dims.get(out_s.trim_start_matches('/')))
-                })
-                .cloned();
+        if dynamic_shape_json.is_none() && shape_values.is_empty() {
             if let Some(dims) = output_dim_shape {
                 let json_dims: Vec<serde_json::Value> = dims
                     .into_iter()
@@ -708,10 +802,45 @@ impl ReshapeHandler {
         if let Some(json_dims) = dynamic_shape_json {
             options.insert("newShape".to_string(), serde_json::json!(json_dims));
         } else {
-            options.insert(
-                "newShape".to_string(),
-                serde_json::json!(shape_values.iter().map(|v| *v as u32).collect::<Vec<_>>()),
-            );
+            // Check if the shape tensor has dynamic dim metadata
+            let expand_dyn: Option<Vec<serde_json::Value>> = context
+                .value_shape_dims
+                .get(&shape_input_raw)
+                .or_else(|| {
+                    let sk = sanitize_identifier(&shape_input_raw);
+                    context.value_shape_dims.get(&sk)
+                })
+                .and_then(|dims| {
+                    if !dims
+                        .iter()
+                        .any(|d| matches!(d, crate::ast::Dimension::Dynamic(_)))
+                    {
+                        return None;
+                    }
+                    if dims.len() != shape_values.len() {
+                        return None;
+                    }
+                    Some(
+                        dims.iter()
+                            .zip(shape_values.iter())
+                            .map(|(d, &sv)| match d {
+                                crate::ast::Dimension::Dynamic(dd) => serde_json::json!({
+                                    "name": dd.name,
+                                    "maxSize": dd.max_size
+                                }),
+                                crate::ast::Dimension::Static(_) => serde_json::json!(sv as u32),
+                            })
+                            .collect(),
+                    )
+                });
+            if let Some(dyn_shape) = expand_dyn {
+                options.insert("newShape".to_string(), serde_json::json!(dyn_shape));
+            } else {
+                options.insert(
+                    "newShape".to_string(),
+                    serde_json::json!(shape_values.iter().map(|v| *v as u32).collect::<Vec<_>>()),
+                );
+            }
         }
 
         let inputs = if let Some(ref shape_ref) = shape_input_ref {
@@ -978,7 +1107,7 @@ impl ReshapeHandler {
             }
         };
         let axes_values = if let Some(rank) = context.input_rank(inputs[0].as_str()) {
-            normalize_axes_best_effort(&axes_values, rank)
+            self.normalize_unsqueeze_axes_best_effort(&axes_values, rank)
         } else {
             axes_values
         };
@@ -1361,6 +1490,53 @@ mod tests {
     }
 
     #[test]
+    fn test_convert_reshape_prefers_dynamic_output_dims_over_static_shape_tensor() {
+        let handler = ReshapeHandler;
+        let node = create_test_node("Reshape", vec!["data", "shape_const"], vec!["reshaped"]);
+
+        let initializers = std::collections::HashMap::new();
+        let mut value_shapes = std::collections::HashMap::new();
+        value_shapes.insert("data".to_string(), vec![4096]);
+        value_shapes.insert("reshaped".to_string(), vec![4096, 1]);
+        let mut value_shape_dims = std::collections::HashMap::new();
+        value_shape_dims.insert(
+            "reshaped".to_string(),
+            vec![
+                crate::ast::Dimension::Dynamic(crate::ast::DynamicDimension {
+                    name: "sequence_length".to_string(),
+                    max_size: 4096,
+                }),
+                crate::ast::Dimension::Static(1),
+            ],
+        );
+        let mut const_values = std::collections::HashMap::new();
+        const_values.insert("shape_const".to_string(), vec![4096, 1]);
+        let value_ids = std::collections::HashMap::new();
+        let value_types = std::collections::HashMap::new();
+        let context = ConversionContext {
+            initializers: &initializers,
+            value_shapes: &value_shapes,
+            value_shape_dims: &value_shape_dims,
+            const_values: &const_values,
+            value_ids: &value_ids,
+            value_types: &value_types,
+        };
+
+        let result = handler
+            .convert(&node, &context)
+            .expect("reshape should convert");
+        assert_eq!(result.nodes.len(), 1);
+        assert_eq!(result.nodes[0].op, "reshape");
+        assert_eq!(
+            result.nodes[0].options.get("newShape"),
+            Some(&serde_json::json!([
+                {"name": "sequence_length", "maxSize": 4096},
+                1
+            ]))
+        );
+    }
+
+    #[test]
     fn test_convert_transpose() {
         let handler = ReshapeHandler;
         let mut node = create_test_node("Transpose", vec!["x"], vec!["y"]);
@@ -1415,6 +1591,60 @@ mod tests {
         assert_eq!(
             result.nodes[0].options.get("newShape"),
             Some(&serde_json::json!([1, 1, 768]))
+        );
+    }
+
+    #[test]
+    fn test_convert_expand_prefers_dynamic_output_dims_over_static_shape_tensor() {
+        let handler = ReshapeHandler;
+        let node = create_test_node("Expand", vec!["data", "shape_const"], vec!["expanded"]);
+
+        let initializers = std::collections::HashMap::new();
+        let mut value_shapes = std::collections::HashMap::new();
+        value_shapes.insert("data".to_string(), vec![1, 1, 4096, 1]);
+        value_shapes.insert("expanded".to_string(), vec![1, 1, 4096, 4096]);
+        let mut value_shape_dims = std::collections::HashMap::new();
+        value_shape_dims.insert(
+            "expanded".to_string(),
+            vec![
+                crate::ast::Dimension::Static(1),
+                crate::ast::Dimension::Static(1),
+                crate::ast::Dimension::Dynamic(crate::ast::DynamicDimension {
+                    name: "sequence_length".to_string(),
+                    max_size: 4096,
+                }),
+                crate::ast::Dimension::Dynamic(crate::ast::DynamicDimension {
+                    name: "past_sequence_length + 1".to_string(),
+                    max_size: 4096,
+                }),
+            ],
+        );
+        let mut const_values = std::collections::HashMap::new();
+        const_values.insert("shape_const".to_string(), vec![1, 1, 1, 1]);
+        let value_ids = std::collections::HashMap::new();
+        let value_types = std::collections::HashMap::new();
+        let context = ConversionContext {
+            initializers: &initializers,
+            value_shapes: &value_shapes,
+            value_shape_dims: &value_shape_dims,
+            const_values: &const_values,
+            value_ids: &value_ids,
+            value_types: &value_types,
+        };
+
+        let result = handler
+            .convert(&node, &context)
+            .expect("expand should convert");
+        assert_eq!(result.nodes.len(), 1);
+        assert_eq!(result.nodes[0].op, "expand");
+        assert_eq!(
+            result.nodes[0].options.get("newShape"),
+            Some(&serde_json::json!([
+                1,
+                1,
+                {"name": "sequence_length", "maxSize": 4096},
+                {"name": "past_sequence_length + 1", "maxSize": 4096}
+            ]))
         );
     }
 
@@ -1569,6 +1799,48 @@ mod tests {
         assert_eq!(
             result.nodes[0].options.get("axes"),
             Some(&serde_json::json!([1, 3]))
+        );
+    }
+
+    #[test]
+    fn test_convert_unsqueeze_opset13_normalizes_negative_axis_against_output_rank() {
+        let handler = ReshapeHandler;
+        let node = create_test_node("Unsqueeze", vec!["x", "axes_tensor"], vec!["y"]);
+
+        let axes_tensor = crate::protos::onnx::TensorProto {
+            name: "axes_tensor".to_string(),
+            data_type: crate::protos::onnx::TensorProto_DataType::Int64.into(),
+            dims: vec![1],
+            int64_data: vec![-1],
+            ..Default::default()
+        };
+
+        let leaked_axes: &'static crate::protos::onnx::TensorProto =
+            Box::leak(Box::new(axes_tensor));
+
+        let mut initializers = std::collections::HashMap::new();
+        initializers.insert("axes_tensor".to_string(), leaked_axes);
+        let mut value_shapes = std::collections::HashMap::new();
+        value_shapes.insert("x".to_string(), vec![2, 3, 4, 5]);
+        let const_values = std::collections::HashMap::new();
+        let value_ids = std::collections::HashMap::new();
+        let value_types = std::collections::HashMap::new();
+        let context = ConversionContext {
+            initializers: &initializers,
+            value_shapes: &value_shapes,
+            value_shape_dims: crate::onnx::ops::empty_value_shape_dims(),
+            const_values: &const_values,
+            value_ids: &value_ids,
+            value_types: &value_types,
+        };
+
+        let result = handler.convert(&node, &context).unwrap();
+
+        assert_eq!(result.nodes.len(), 1);
+        assert_eq!(result.nodes[0].op, "unsqueeze");
+        assert_eq!(
+            result.nodes[0].options.get("axes"),
+            Some(&serde_json::json!([4]))
         );
     }
 

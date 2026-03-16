@@ -130,23 +130,133 @@ impl UtilityHandler {
             )));
         }
 
+        let output_name = if node.output.as_slice().is_empty() {
+            format!("{}_output", node_name)
+        } else {
+            sanitize_identifier(&node.output.as_slice()[0].to_string())
+        };
+
         let start = self.read_scalar_i64(&inputs[0], context);
         let limit = self.read_scalar_i64(&inputs[1], context);
         let delta = self.read_scalar_i64(&inputs[2], context);
 
-        if start.is_none() || limit.is_none() || delta.is_none() {
-            crate::debug_println!(
-                "[range] falling back to default scalars for {}: start={:?} limit={:?} delta={:?}",
-                node_name,
+        let start_dim = crate::onnx::convert::dynamic_scalar_dimension_for_value(
+            &inputs[0],
+            context.value_shape_dims,
+        );
+        if let (Some(start), Some(delta), Some(limit_dim)) = (
+            start,
+            delta,
+            crate::onnx::convert::dynamic_scalar_dimension_for_value(
+                &inputs[1],
+                context.value_shape_dims,
+            ),
+        ) {
+            let range_dim = crate::onnx::convert::dynamic_range_length_dimension(
                 start,
-                limit,
-                delta
+                delta,
+                start_dim.as_ref(),
+                &limit_dim,
+            )
+            .ok_or_else(|| {
+                OnnxError::InvalidShape(format!(
+                    "Range {} requires dynamic range length to be representable as <dim> +/- const with delta=1",
+                    node_name,
+                ))
+            })?;
+
+            let max_len = usize::try_from(range_dim.max_size).map_err(|_| {
+                OnnxError::InvalidShape(format!(
+                    "Range {} max size {} does not fit in usize",
+                    node_name, range_dim.max_size
+                ))
+            })?;
+
+            let use_runtime_start = start_dim.is_some();
+            let mut values = Vec::with_capacity(max_len.max(1));
+            let mut current = if use_runtime_start { 0 } else { start };
+            for _ in 0..max_len {
+                values.push(current);
+                current += delta;
+            }
+            if values.is_empty() {
+                values.push(if use_runtime_start { 0 } else { start });
+            }
+
+            let bytes: Vec<u8> = values
+                .iter()
+                .flat_map(|v| v.to_le_bytes().to_vec())
+                .collect();
+
+            let range_const_name = format!("{}_range_const", output_name);
+            let range_const = ConstDecl {
+                data_type: DataType::Int64,
+                shape: vec![values.len() as u32],
+                init: ConstInit::InlineBytes { bytes },
+            };
+
+            let mut options = Map::new();
+            options.insert("starts".to_string(), json!([0]));
+            options.insert(
+                "sizes".to_string(),
+                json!([{
+                    "name": range_dim.name,
+                    "maxSize": range_dim.max_size
+                }]),
             );
+            options.insert("strides".to_string(), json!([1]));
+
+            let sliced_name = if use_runtime_start {
+                format!("{}_slice", output_name)
+            } else {
+                output_name.clone()
+            };
+            let mut nodes = vec![Node {
+                id: sliced_name.clone(),
+                op: "slice".to_string(),
+                inputs: vec![range_const_name.clone()],
+                options,
+                outputs: None,
+            }];
+            if use_runtime_start {
+                nodes.push(Node {
+                    id: output_name.clone(),
+                    op: "add".to_string(),
+                    inputs: vec![sliced_name, context.resolve_input(&inputs[0])],
+                    options: Map::new(),
+                    outputs: None,
+                });
+            }
+
+            let mut result = ConversionResult::new(nodes);
+            result.consts.push((range_const_name, range_const));
+            if let Some(out) = node.output.as_slice().first() {
+                result
+                    .output_mappings
+                    .insert(out.to_string(), output_name.clone());
+                result.output_types.insert(out.to_string(), DataType::Int64);
+            }
+            return Ok(result);
         }
 
-        let start = start.unwrap_or(0);
-        let limit = limit.unwrap_or(1);
-        let delta = delta.unwrap_or(1);
+        let start = start.ok_or_else(|| {
+            OnnxError::InvalidShape(format!(
+                "Range {} requires a constant scalar start input",
+                node_name
+            ))
+        })?;
+        let limit = limit.ok_or_else(|| {
+            OnnxError::InvalidShape(format!(
+                "Range {} requires a constant scalar or supported dynamic limit input",
+                node_name
+            ))
+        })?;
+        let delta = delta.ok_or_else(|| {
+            OnnxError::InvalidShape(format!(
+                "Range {} requires a constant scalar delta input",
+                node_name
+            ))
+        })?;
 
         if delta == 0 {
             return Err(OnnxError::InvalidShape(
@@ -176,12 +286,6 @@ impl UtilityHandler {
             .iter()
             .flat_map(|v| v.to_le_bytes().to_vec())
             .collect();
-
-        let output_name = if node.output.as_slice().is_empty() {
-            format!("{}_output", node_name)
-        } else {
-            sanitize_identifier(&node.output.as_slice()[0].to_string())
-        };
 
         let const_decl = ConstDecl {
             data_type: DataType::Int64,
@@ -287,6 +391,20 @@ impl UtilityHandler {
             sanitize_identifier(&node.output.as_slice()[0].to_string())
         };
 
+        let output_dim_shape = node
+            .output
+            .as_slice()
+            .first()
+            .and_then(|out| {
+                let out_s = out.to_string();
+                context
+                    .value_shape_dims
+                    .get(&out_s)
+                    .or_else(|| context.value_shape_dims.get(&sanitize_identifier(&out_s)))
+                    .or_else(|| context.value_shape_dims.get(out_s.trim_start_matches('/')))
+            })
+            .cloned();
+
         // Determine the target shape: prefer inferred output shape, otherwise try the shape input const.
         let mut shape: Option<Vec<i64>> = None;
         if let Some(out) = node.output.as_slice().first() {
@@ -311,8 +429,6 @@ impl UtilityHandler {
                 }
             }
         }
-
-        let shape = shape.unwrap_or_else(|| vec![1]);
 
         // Determine fill value and data type (default int64 zero)
         let mut fill_value_i64: i64 = 0;
@@ -355,6 +471,59 @@ impl UtilityHandler {
                 }
             }
         }
+
+        if let Some(dims) = output_dim_shape.as_ref().filter(|dims| {
+            dims.iter()
+                .any(|d| matches!(d, crate::ast::Dimension::Dynamic(_)))
+        }) {
+            let scalar_name = format!("{}_fill", output_name);
+            let scalar_bytes = match dtype {
+                DataType::Float32 => {
+                    let f = f32::from_bits(fill_value_i64 as u32);
+                    f.to_le_bytes().to_vec()
+                }
+                _ => fill_value_i64.to_le_bytes().to_vec(),
+            };
+            let scalar_decl = ConstDecl {
+                data_type: dtype.clone(),
+                shape: vec![1],
+                init: ConstInit::InlineBytes {
+                    bytes: scalar_bytes,
+                },
+            };
+
+            let new_shape: Vec<serde_json::Value> = dims
+                .iter()
+                .map(|d| match d {
+                    crate::ast::Dimension::Static(v) => serde_json::json!(v),
+                    crate::ast::Dimension::Dynamic(dd) => serde_json::json!({
+                        "name": dd.name,
+                        "maxSize": dd.max_size
+                    }),
+                })
+                .collect();
+
+            let mut options = Map::new();
+            options.insert("newShape".to_string(), serde_json::json!(new_shape));
+
+            let mut result = ConversionResult::new(vec![Node {
+                id: output_name.clone(),
+                op: "expand".to_string(),
+                inputs: vec![scalar_name.clone()],
+                options,
+                outputs: None,
+            }]);
+            result.consts.push((scalar_name, scalar_decl));
+            if let Some(out) = node.output.as_slice().first() {
+                result
+                    .output_mappings
+                    .insert(out.to_string(), output_name.clone());
+                result.output_types.insert(out.to_string(), dtype);
+            }
+            return Ok(result);
+        }
+
+        let shape = shape.unwrap_or_else(|| vec![1]);
 
         let mut numel: usize = 1;
         for d in &shape {
@@ -668,6 +837,17 @@ impl UtilityHandler {
                 let mut dense_sizes: Vec<i64> = input_shape.clone();
                 let mut dense_strides = vec![1i64; rank];
 
+                // Check if ends input has dynamic dimension metadata
+                let ends_dims = context.value_shape_dims.get(ends_name).or_else(|| {
+                    context
+                        .value_shape_dims
+                        .get(&sanitize_identifier(ends_name))
+                });
+
+                // Track which dense axes have dynamic sizes
+                let mut dynamic_size_info: Vec<Option<crate::ast::DynamicDimension>> =
+                    vec![None; rank];
+
                 for i in 0..desired_len {
                     let axis = axes[i] as usize;
                     let dim = input_shape[axis];
@@ -697,13 +877,42 @@ impl UtilityHandler {
                         (end - start + step - 1) / step
                     };
 
+                    // If this end value came from a dynamic dimension, mark the size as dynamic
+                    if let Some(dims) = ends_dims {
+                        if let Some(crate::ast::Dimension::Dynamic(dd)) = dims.get(i) {
+                            dynamic_size_info[axis] = Some(crate::ast::DynamicDimension {
+                                name: dd.name.clone(),
+                                max_size: size as u32,
+                            });
+                        }
+                    }
+
                     dense_starts[axis] = start;
                     dense_sizes[axis] = size;
                     dense_strides[axis] = step;
                 }
 
                 options.insert("starts".to_string(), serde_json::json!(dense_starts));
-                options.insert("sizes".to_string(), serde_json::json!(dense_sizes));
+
+                // Emit sizes with dynamic dimension metadata when present
+                let has_dynamic = dynamic_size_info.iter().any(|d| d.is_some());
+                if has_dynamic {
+                    let sizes_json: Vec<serde_json::Value> = dense_sizes
+                        .iter()
+                        .zip(dynamic_size_info.iter())
+                        .map(|(&sz, dyn_info)| match dyn_info {
+                            Some(dd) => serde_json::json!({
+                                "name": dd.name,
+                                "maxSize": dd.max_size
+                            }),
+                            None => serde_json::json!(sz),
+                        })
+                        .collect();
+                    options.insert("sizes".to_string(), serde_json::json!(sizes_json));
+                } else {
+                    options.insert("sizes".to_string(), serde_json::json!(dense_sizes));
+                }
+
                 options.insert("strides".to_string(), serde_json::json!(dense_strides));
             } else {
                 // Fallback for unknown-rank tensors: keep ONNX-style static slice options.
@@ -856,7 +1065,7 @@ impl UtilityHandler {
 mod tests {
     use super::*;
     use crate::ast::DataType;
-    use crate::protos::onnx::{AttributeProto, NodeProto};
+    use crate::protos::onnx::{AttributeProto, NodeProto, TensorProto, TensorProto_DataType};
     use serde_json::json;
 
     fn create_test_node(op_type: &str, inputs: Vec<&str>, outputs: Vec<&str>) -> NodeProto {
@@ -990,6 +1199,67 @@ mod tests {
         assert!(!result.nodes[0].options.contains_key("ends"));
         assert!(!result.nodes[0].options.contains_key("axes"));
         assert!(!result.nodes[0].options.contains_key("steps"));
+    }
+
+    #[test]
+    fn test_convert_constant_of_shape_prefers_dynamic_output_dims() {
+        let handler = UtilityHandler;
+        let mut node = create_test_node("ConstantOfShape", vec!["shape"], vec!["output"]);
+        node.attribute.push(AttributeProto {
+            name: "value".to_string(),
+            t: Some(TensorProto {
+                data_type: TensorProto_DataType::Float as i32,
+                dims: vec![],
+                raw_data: 0f32.to_le_bytes().to_vec(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+
+        let initializers = std::collections::HashMap::new();
+        let mut value_shapes = std::collections::HashMap::new();
+        value_shapes.insert("output".to_string(), vec![4096, 4096]);
+        let mut value_shape_dims = std::collections::HashMap::new();
+        value_shape_dims.insert(
+            "output".to_string(),
+            vec![
+                crate::ast::Dimension::Dynamic(crate::ast::DynamicDimension {
+                    name: "sequence_length".to_string(),
+                    max_size: 4096,
+                }),
+                crate::ast::Dimension::Dynamic(crate::ast::DynamicDimension {
+                    name: "past_sequence_length + 1".to_string(),
+                    max_size: 4096,
+                }),
+            ],
+        );
+        let mut const_values = std::collections::HashMap::new();
+        const_values.insert("shape".to_string(), vec![4096, 4096]);
+        let value_ids = std::collections::HashMap::new();
+        let value_types = std::collections::HashMap::new();
+        let context = ConversionContext {
+            initializers: &initializers,
+            value_shapes: &value_shapes,
+            value_shape_dims: &value_shape_dims,
+            const_values: &const_values,
+            value_ids: &value_ids,
+            value_types: &value_types,
+        };
+
+        let result = handler.convert(&node, &context).unwrap();
+        assert_eq!(result.nodes.len(), 1);
+        assert_eq!(result.nodes[0].op, "expand");
+        assert_eq!(result.nodes[0].inputs.len(), 1);
+        assert_eq!(result.consts.len(), 1);
+        assert_eq!(result.consts[0].1.shape, vec![1]);
+        assert_eq!(
+            result.nodes[0].options.get("newShape"),
+            Some(&json!([
+                {"name": "sequence_length", "maxSize": 4096},
+                {"name": "past_sequence_length + 1", "maxSize": 4096}
+            ]))
+        );
+        assert_eq!(result.output_types.get("output"), Some(&DataType::Float32));
     }
 
     #[test]

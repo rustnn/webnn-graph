@@ -670,6 +670,343 @@ fn fold_binary_const_i64(
     Some((out_values, out_shape))
 }
 
+fn value_shape_dims_for<'a>(
+    name: &str,
+    value_shape_dims: &'a HashMap<String, Vec<Dimension>>,
+) -> Option<&'a [Dimension]> {
+    let sanitized = sanitize_identifier(name);
+    let trimmed = name.trim_start_matches('/');
+    value_shape_dims
+        .get(name)
+        .or_else(|| value_shape_dims.get(&sanitized))
+        .or_else(|| value_shape_dims.get(trimmed))
+        .map(Vec::as_slice)
+}
+
+fn dims_contain_dynamic(dims: &[Dimension]) -> bool {
+    dims.iter().any(|d| matches!(d, Dimension::Dynamic(_)))
+}
+
+pub(crate) fn parse_dynamic_dim_expr(dim_name: &str) -> (String, i64) {
+    let s = dim_name.trim();
+    if let Some((lhs, rhs)) = s.rsplit_once('+') {
+        if let Ok(offset) = rhs.trim().parse::<i64>() {
+            return (lhs.trim().to_string(), offset);
+        }
+    }
+    if let Some((lhs, rhs)) = s.rsplit_once('-') {
+        if let Ok(offset) = rhs.trim().parse::<i64>() {
+            return (lhs.trim().to_string(), -offset);
+        }
+    }
+    (s.to_string(), 0)
+}
+
+pub(crate) fn format_dynamic_dim_expr(base: &str, offset: i64) -> String {
+    if offset > 0 {
+        format!("{base} + {offset}")
+    } else if offset < 0 {
+        format!("{base} - {}", offset.abs())
+    } else {
+        base.to_string()
+    }
+}
+
+fn parse_additive_dynamic_dim_expr(dim_name: &str) -> Option<(BTreeMap<String, i64>, i64)> {
+    let expr = dim_name.trim();
+    if expr.is_empty() {
+        return None;
+    }
+
+    let normalized = expr.replace('+', " + ").replace('-', " - ");
+    let mut terms = BTreeMap::new();
+    let mut constant = 0i64;
+    let mut sign = 1i64;
+    let mut saw_term = false;
+
+    for token in normalized.split_whitespace() {
+        match token {
+            "+" => sign = 1,
+            "-" => sign = -1,
+            _ => {
+                saw_term = true;
+                if let Ok(value) = token.parse::<i64>() {
+                    constant += sign * value;
+                } else {
+                    *terms.entry(token.to_string()).or_insert(0) += sign;
+                }
+                sign = 1;
+            }
+        }
+    }
+
+    if !saw_term {
+        return None;
+    }
+
+    terms.retain(|_, coeff| *coeff != 0);
+    Some((terms, constant))
+}
+
+fn format_additive_dynamic_dim_expr(
+    terms: &BTreeMap<String, i64>,
+    constant: i64,
+) -> Option<String> {
+    if terms.is_empty() && constant == 0 {
+        return None;
+    }
+
+    let mut out = String::new();
+    for (name, coeff) in terms {
+        for _ in 0..coeff.abs() {
+            if out.is_empty() {
+                if *coeff < 0 {
+                    out.push_str("- ");
+                }
+                out.push_str(name);
+            } else if *coeff < 0 {
+                out.push_str(" - ");
+                out.push_str(name);
+            } else {
+                out.push_str(" + ");
+                out.push_str(name);
+            }
+        }
+    }
+
+    if constant != 0 {
+        if out.is_empty() {
+            out.push_str(&constant.to_string());
+        } else if constant < 0 {
+            out.push_str(" - ");
+            out.push_str(&constant.abs().to_string());
+        } else {
+            out.push_str(" + ");
+            out.push_str(&constant.to_string());
+        }
+    }
+
+    Some(out)
+}
+
+fn is_runtime_resolvable_dynamic_dim_expr(dim_name: &str) -> bool {
+    let s = dim_name.trim();
+    if s.is_empty() || s.contains('*') || s.contains('/') {
+        return false;
+    }
+    if let Some((lhs, rhs)) = s.rsplit_once('+') {
+        return !lhs.trim().is_empty() && rhs.trim().parse::<i64>().is_ok();
+    }
+    if let Some((lhs, rhs)) = s.rsplit_once('-') {
+        return !lhs.trim().is_empty() && rhs.trim().parse::<i64>().is_ok();
+    }
+    true
+}
+
+fn shift_dynamic_dimension(dim: &DynamicDimension, delta: i64) -> Option<DynamicDimension> {
+    let (base, offset) = parse_dynamic_dim_expr(&dim.name);
+    let name = format_dynamic_dim_expr(&base, offset.checked_add(delta)?);
+    let shifted_max = (dim.max_size as i64).checked_add(delta)?.max(0);
+    let max_size = u32::try_from(shifted_max).ok()?;
+    Some(DynamicDimension { name, max_size })
+}
+
+pub(crate) fn dynamic_scalar_dimension_for_value(
+    name: &str,
+    value_shape_dims: &HashMap<String, Vec<Dimension>>,
+) -> Option<DynamicDimension> {
+    let dims = value_shape_dims_for(name, value_shape_dims)?;
+    if dims.len() != 1 {
+        return None;
+    }
+    match &dims[0] {
+        Dimension::Dynamic(dim) => Some(dim.clone()),
+        Dimension::Static(_) => None,
+    }
+}
+
+fn dimension_vector_for_value(
+    name: &str,
+    const_values: &HashMap<String, Vec<i64>>,
+    value_shape_dims: &HashMap<String, Vec<Dimension>>,
+) -> Option<Vec<Dimension>> {
+    if let Some(dims) = value_shape_dims_for(name, value_shape_dims) {
+        return Some(dims.to_vec());
+    }
+    let values = const_values.get(name)?;
+    values
+        .iter()
+        .map(|&v| u32::try_from(v).ok().map(Dimension::Static))
+        .collect()
+}
+
+fn is_trivial_static_dimension_vector(dims: &[Dimension]) -> bool {
+    dims.len() <= 3 && dims.iter().all(|d| matches!(d, Dimension::Static(1)))
+}
+
+fn combine_binary_dimension(
+    op_type: &str,
+    dynamic: &DynamicDimension,
+    static_value: i64,
+    dynamic_on_lhs: bool,
+) -> Option<Dimension> {
+    match op_type {
+        "Add" => shift_dynamic_dimension(dynamic, static_value).map(Dimension::Dynamic),
+        "Sub" if dynamic_on_lhs => {
+            shift_dynamic_dimension(dynamic, -static_value).map(Dimension::Dynamic)
+        }
+        "Mul" if static_value == 0 => Some(Dimension::Static(0)),
+        "Mul" if static_value == 1 => Some(Dimension::Dynamic(dynamic.clone())),
+        "Mul" if static_value > 1 => Some(Dimension::Dynamic(DynamicDimension {
+            name: if dynamic_on_lhs {
+                format!("{} * {}", dynamic.name, static_value)
+            } else {
+                format!("{} * {}", static_value, dynamic.name)
+            },
+            max_size: dynamic.max_size.saturating_mul(static_value as u32),
+        })),
+        "Div" if dynamic_on_lhs && static_value == 1 => Some(Dimension::Dynamic(dynamic.clone())),
+        "Div" if dynamic_on_lhs && static_value > 1 => Some(Dimension::Dynamic(DynamicDimension {
+            name: format!("{} / {}", dynamic.name, static_value),
+            max_size: dynamic.max_size / (static_value as u32),
+        })),
+        _ => None,
+    }
+}
+
+fn combine_dynamic_dimensions(
+    op_type: &str,
+    lhs: &DynamicDimension,
+    rhs: &DynamicDimension,
+    lhs_value: i64,
+    rhs_value: i64,
+) -> Option<Dimension> {
+    match op_type {
+        "Add" | "Sub" => {
+            let (mut terms, mut constant) = parse_additive_dynamic_dim_expr(&lhs.name)?;
+            let (rhs_terms, rhs_constant) = parse_additive_dynamic_dim_expr(&rhs.name)?;
+            let rhs_sign = if op_type == "Add" { 1 } else { -1 };
+
+            for (name, coeff) in rhs_terms {
+                *terms.entry(name).or_insert(0) += rhs_sign * coeff;
+            }
+            constant += rhs_sign * rhs_constant;
+            terms.retain(|_, coeff| *coeff != 0);
+
+            let value = if op_type == "Add" {
+                lhs_value.checked_add(rhs_value)?
+            } else {
+                lhs_value.checked_sub(rhs_value)?
+            };
+            if terms.is_empty() {
+                return u32::try_from(value).ok().map(Dimension::Static);
+            }
+
+            let name = format_additive_dynamic_dim_expr(&terms, constant)?;
+            let max_size = u32::try_from(value).ok()?;
+            Some(Dimension::Dynamic(DynamicDimension { name, max_size }))
+        }
+        _ => None,
+    }
+}
+
+fn fold_binary_dynamic_dims(
+    op_type: &str,
+    a_values: &[i64],
+    b_values: &[i64],
+    a_shape: &[i64],
+    b_shape: &[i64],
+    a_dims: Option<&[Dimension]>,
+    b_dims: Option<&[Dimension]>,
+) -> Option<Vec<Dimension>> {
+    let out_shape = broadcast_shape(a_shape, b_shape)?;
+    let out_numel = shape_numel(&out_shape)?;
+    let mut out_dims = Vec::with_capacity(out_numel);
+    let mut has_dynamic = false;
+
+    for out_idx in 0..out_numel {
+        let a_idx = linear_index_for_broadcast_operand(out_idx, &out_shape, a_shape)?;
+        let b_idx = linear_index_for_broadcast_operand(out_idx, &out_shape, b_shape)?;
+        let av = *a_values.get(a_idx)?;
+        let bv = *b_values.get(b_idx)?;
+        let a_dim = a_dims.and_then(|dims| dims.get(a_idx));
+        let b_dim = b_dims.and_then(|dims| dims.get(b_idx));
+
+        let out_dim = match (a_dim, b_dim) {
+            (Some(Dimension::Dynamic(dynamic)), Some(Dimension::Static(_)))
+            | (Some(Dimension::Dynamic(dynamic)), None) => {
+                let dim = combine_binary_dimension(op_type, dynamic, bv, true)?;
+                has_dynamic |= matches!(dim, Dimension::Dynamic(_));
+                dim
+            }
+            (Some(Dimension::Static(_)), Some(Dimension::Dynamic(dynamic)))
+            | (None, Some(Dimension::Dynamic(dynamic))) => {
+                let dim = combine_binary_dimension(op_type, dynamic, av, false)?;
+                has_dynamic |= matches!(dim, Dimension::Dynamic(_));
+                dim
+            }
+            (Some(Dimension::Dynamic(a_dynamic)), Some(Dimension::Dynamic(b_dynamic))) => {
+                let dim = combine_dynamic_dimensions(op_type, a_dynamic, b_dynamic, av, bv)?;
+                has_dynamic |= matches!(dim, Dimension::Dynamic(_));
+                dim
+            }
+            _ => {
+                let value = match op_type {
+                    "Add" => av + bv,
+                    "Sub" => av - bv,
+                    "Mul" => av * bv,
+                    "Div" => {
+                        if bv == 0 {
+                            return None;
+                        }
+                        av / bv
+                    }
+                    _ => return None,
+                };
+                Dimension::Static(u32::try_from(value).ok()?)
+            }
+        };
+
+        out_dims.push(out_dim);
+    }
+
+    has_dynamic.then_some(out_dims)
+}
+
+pub(crate) fn dynamic_range_length_dimension(
+    start: i64,
+    delta: i64,
+    start_dim: Option<&DynamicDimension>,
+    limit: &DynamicDimension,
+) -> Option<DynamicDimension> {
+    if delta != 1 {
+        return None;
+    }
+
+    let (mut terms, mut constant) = parse_additive_dynamic_dim_expr(&limit.name)?;
+    if let Some(start_dim) = start_dim {
+        let (start_terms, start_constant) = parse_additive_dynamic_dim_expr(&start_dim.name)?;
+        for (name, coeff) in start_terms {
+            *terms.entry(name).or_insert(0) -= coeff;
+        }
+        constant -= start_constant;
+    } else {
+        constant -= start;
+    }
+    terms.retain(|_, coeff| *coeff != 0);
+    if terms.is_empty() {
+        return None;
+    }
+
+    let name = format_additive_dynamic_dim_expr(&terms, constant)?;
+    if !is_runtime_resolvable_dynamic_dim_expr(&name) {
+        return None;
+    }
+
+    let max_size = u32::try_from((limit.max_size as i64).checked_sub(start)?).ok()?;
+    Some(DynamicDimension { name, max_size })
+}
+
 /// Conversion options for ONNX to WebNN
 #[derive(Debug, Clone)]
 pub struct ConvertOptions {
@@ -1516,6 +1853,30 @@ Provide --override-dim {}=<value> or enable --experimental-dynamic-inputs.",
                         let out = out.to_string();
                         if let Some(shape) = value_shapes.get(inp).cloned() {
                             if shape.iter().all(|d| *d > 0) {
+                                // Propagate dynamic dim metadata: Shape output is a 1-D
+                                // tensor whose elements correspond to input dimensions.
+                                if options.experimental_dynamic_inputs {
+                                    let inp_s = inp.to_string();
+                                    if let Some(dims) = value_shape_dims.get(&inp_s).or_else(|| {
+                                        value_shape_dims.get(&sanitize_identifier(&inp_s))
+                                    }) {
+                                        // Each element of the Shape output corresponds to one
+                                        // input dimension.  Build a 1-D dim vector where
+                                        // dynamic input dims become Dynamic elements.
+                                        let out_dims: Vec<crate::ast::Dimension> = dims
+                                            .iter()
+                                            .map(|d| match d {
+                                                crate::ast::Dimension::Dynamic(dd) => {
+                                                    crate::ast::Dimension::Dynamic(dd.clone())
+                                                }
+                                                crate::ast::Dimension::Static(v) => {
+                                                    crate::ast::Dimension::Static(*v)
+                                                }
+                                            })
+                                            .collect();
+                                        value_shape_dims.insert(out.clone(), out_dims);
+                                    }
+                                }
                                 const_values.insert(out.clone(), shape.clone());
                                 let inferred_shape = vec![shape.len() as i64];
                                 // Force the correct shape - Shape operation computes exact output shape
@@ -1544,6 +1905,17 @@ Provide --override-dim {}=<value> or enable --experimental-dynamic-inputs.",
 
                             if axis == 0 {
                                 let mut gathered = Vec::new();
+                                let mut gathered_dims = Vec::new();
+                                let data_dims = if options.experimental_dynamic_inputs {
+                                    value_shape_dims
+                                        .get(data_name)
+                                        .or_else(|| {
+                                            value_shape_dims.get(&sanitize_identifier(data_name))
+                                        })
+                                        .cloned()
+                                } else {
+                                    None
+                                };
                                 for &idx in indices {
                                     let i = if idx < 0 {
                                         (data.len() as i64 + idx) as usize
@@ -1552,9 +1924,22 @@ Provide --override-dim {}=<value> or enable --experimental-dynamic-inputs.",
                                     };
                                     if let Some(v) = data.get(i) {
                                         gathered.push(*v);
+                                        if let Some(ref dd) = data_dims {
+                                            if let Some(dim) = dd.get(i) {
+                                                gathered_dims.push(dim.clone());
+                                            }
+                                        }
                                     }
                                 }
                                 if !gathered.is_empty() {
+                                    if options.experimental_dynamic_inputs
+                                        && gathered_dims.len() == gathered.len()
+                                        && gathered_dims
+                                            .iter()
+                                            .any(|d| matches!(d, crate::ast::Dimension::Dynamic(_)))
+                                    {
+                                        value_shape_dims.insert(out.to_string(), gathered_dims);
+                                    }
                                     const_values.insert(out.to_string(), gathered.clone());
                                     let out_shape = if gathered.len() == 1 {
                                         Vec::new()
@@ -1584,6 +1969,17 @@ Provide --override-dim {}=<value> or enable --experimental-dynamic-inputs.",
                                 if let Some((result_vals, out_shape)) =
                                     fold_binary_const_i64(op_type, a, b, &a_shape, &b_shape)
                                 {
+                                    if options.experimental_dynamic_inputs {
+                                        let a_dims =
+                                            value_shape_dims_for(a_name, &value_shape_dims);
+                                        let b_dims =
+                                            value_shape_dims_for(b_name, &value_shape_dims);
+                                        if let Some(out_dims) = fold_binary_dynamic_dims(
+                                            op_type, a, b, &a_shape, &b_shape, a_dims, b_dims,
+                                        ) {
+                                            value_shape_dims.insert(out.to_string(), out_dims);
+                                        }
+                                    }
                                     const_values.insert(out.to_string(), result_vals.clone());
                                     // Force the correct shape - Binary operations compute exact output shape
                                     value_shapes.insert(out.to_string(), out_shape.clone());
@@ -1606,6 +2002,16 @@ Provide --override-dim {}=<value> or enable --experimental-dynamic-inputs.",
                         node.output.as_slice().first(),
                     ) {
                         if let Some(vals) = const_values.get(inp).cloned() {
+                            // Propagate dynamic dim metadata
+                            if options.experimental_dynamic_inputs {
+                                if let Some(dims) = value_shape_dims
+                                    .get(inp)
+                                    .or_else(|| value_shape_dims.get(&sanitize_identifier(inp)))
+                                    .cloned()
+                                {
+                                    value_shape_dims.insert(out.to_string(), dims);
+                                }
+                            }
                             const_values.insert(out.to_string(), vals.clone());
                             let out_shape = if vals.len() == 1 {
                                 Vec::new()
@@ -1620,13 +2026,54 @@ Provide --override-dim {}=<value> or enable --experimental-dynamic-inputs.",
                         }
                     }
                 } else if op_type == "Range" {
-                    // Range(start, limit, delta) -> [start, start+delta, start+2*delta, ...]
                     if node.input.as_slice().len() == 3 {
                         if let (Some(start_name), Some(limit_name), Some(delta_name)) = (
                             node.input.as_slice().first(),
                             node.input.as_slice().get(1),
                             node.input.as_slice().get(2),
                         ) {
+                            if options.experimental_dynamic_inputs {
+                                let start_dim = dynamic_scalar_dimension_for_value(
+                                    start_name,
+                                    &value_shape_dims,
+                                );
+                                if let Some(limit_dim) = dynamic_scalar_dimension_for_value(
+                                    limit_name,
+                                    &value_shape_dims,
+                                ) {
+                                    if let (Some(start_vals), Some(delta_vals), Some(out)) = (
+                                        const_values.get(start_name),
+                                        const_values.get(delta_name),
+                                        node.output.as_slice().first(),
+                                    ) {
+                                        if !start_vals.is_empty() && !delta_vals.is_empty() {
+                                            let start = start_vals[0];
+                                            let delta = delta_vals[0];
+                                            if let Some(range_dim) = dynamic_range_length_dimension(
+                                                start,
+                                                delta,
+                                                start_dim.as_ref(),
+                                                &limit_dim,
+                                            ) {
+                                                let out_shape = vec![range_dim.max_size as i64];
+                                                value_shape_dims.insert(
+                                                    out.to_string(),
+                                                    vec![Dimension::Dynamic(range_dim.clone())],
+                                                );
+                                                value_shapes
+                                                    .insert(out.to_string(), out_shape.clone());
+                                                value_shapes
+                                                    .insert(sanitize_identifier(out), out_shape);
+                                                value_types
+                                                    .insert(out.to_string(), DataType::Int64);
+                                            }
+                                        }
+                                    }
+                                    continue;
+                                }
+                            }
+
+                            // Range(start, limit, delta) -> [start, start+delta, start+2*delta, ...]
                             if let (Some(start_vals), Some(limit_vals), Some(delta_vals)) = (
                                 const_values.get(start_name),
                                 const_values.get(limit_name),
@@ -1698,6 +2145,32 @@ Provide --override-dim {}=<value> or enable --experimental-dynamic-inputs.",
                                     concatenated
                                 );
                             }
+                            // Propagate dynamic dim metadata through concat
+                            if options.experimental_dynamic_inputs {
+                                let mut concat_dims: Vec<crate::ast::Dimension> = Vec::new();
+                                let mut has_dynamic = false;
+                                for inp in node.input.as_slice() {
+                                    let inp_s = inp.to_string();
+                                    if let Some(dims) = value_shape_dims.get(&inp_s).or_else(|| {
+                                        value_shape_dims.get(&sanitize_identifier(&inp_s))
+                                    }) {
+                                        for d in dims {
+                                            if matches!(d, crate::ast::Dimension::Dynamic(_)) {
+                                                has_dynamic = true;
+                                            }
+                                            concat_dims.push(d.clone());
+                                        }
+                                    } else if let Some(vals) = const_values.get(inp) {
+                                        for v in vals {
+                                            concat_dims
+                                                .push(crate::ast::Dimension::Static(*v as u32));
+                                        }
+                                    }
+                                }
+                                if has_dynamic && concat_dims.len() == concatenated.len() {
+                                    value_shape_dims.insert(out.to_string(), concat_dims);
+                                }
+                            }
                             const_values.insert(out.to_string(), concatenated.clone());
                             let out_shape = vec![concatenated.len() as i64];
                             // Force the correct shape - Concat computes exact output shape
@@ -1709,6 +2182,21 @@ Provide --override-dim {}=<value> or enable --experimental-dynamic-inputs.",
                 } else if op_type == "ConstantOfShape" {
                     // ConstantOfShape(shape) -> tensor filled with constant value
                     if let Some(shape_name) = node.input.as_slice().first() {
+                        let dynamic_output_dims = if options.experimental_dynamic_inputs {
+                            value_shape_dims_for(shape_name, &value_shape_dims)
+                                .map(|dims| dims.to_vec())
+                                .filter(|dims| dims_contain_dynamic(dims))
+                        } else {
+                            None
+                        };
+
+                        if let (Some(out), Some(dims)) =
+                            (node.output.as_slice().first(), dynamic_output_dims.as_ref())
+                        {
+                            value_shape_dims.insert(out.to_string(), dims.to_vec());
+                            const_values.remove(out.as_str());
+                        }
+
                         if let Some(shape_vals) = const_values.get(shape_name).cloned() {
                             // Get the fill value from attributes (default is 0)
                             let mut fill_value = 0i64;
@@ -1745,7 +2233,14 @@ Provide --override-dim {}=<value> or enable --experimental-dynamic-inputs.",
                                 // Reasonable size limit
                                 let filled_tensor = vec![fill_value; numel as usize];
                                 if let Some(out) = node.output.as_slice().first() {
-                                    const_values.insert(out.to_string(), filled_tensor);
+                                    let should_keep_const = dynamic_output_dims
+                                        .as_ref()
+                                        .is_none_or(|dims| !dims_contain_dynamic(dims));
+                                    if should_keep_const {
+                                        const_values.insert(out.to_string(), filled_tensor);
+                                    } else {
+                                        const_values.remove(out.as_str());
+                                    }
                                     // Force the correct shape - ConstantOfShape creates exact output shape
                                     value_shapes.insert(out.to_string(), shape_vals.clone());
                                     value_shapes
@@ -1781,6 +2276,104 @@ Provide --override-dim {}=<value> or enable --experimental-dynamic-inputs.",
                         }
                     }
                 } else if op_type == "Where" {
+                    if options.experimental_dynamic_inputs && node.input.as_slice().len() >= 3 {
+                        if let Some(out) = node.output.as_slice().first() {
+                            let cond = const_values.get(node.input.as_slice()[0].as_str());
+                            let a_dims = dimension_vector_for_value(
+                                node.input.as_slice()[1].as_str(),
+                                &const_values,
+                                &value_shape_dims,
+                            );
+                            let b_dims = dimension_vector_for_value(
+                                node.input.as_slice()[2].as_str(),
+                                &const_values,
+                                &value_shape_dims,
+                            );
+                            let out_dims = if let (Some(cond), Some(a_dims), Some(b_dims)) =
+                                (cond, a_dims.as_ref(), b_dims.as_ref())
+                            {
+                                if cond.len() == 1 && a_dims.len() == b_dims.len() {
+                                    Some(if cond[0] != 0 {
+                                        a_dims.clone()
+                                    } else {
+                                        b_dims.clone()
+                                    })
+                                } else if cond.len() == a_dims.len() && cond.len() == b_dims.len() {
+                                    Some(
+                                        cond.iter()
+                                            .enumerate()
+                                            .map(|(idx, c)| {
+                                                if *c != 0 {
+                                                    a_dims[idx].clone()
+                                                } else {
+                                                    b_dims[idx].clone()
+                                                }
+                                            })
+                                            .collect(),
+                                    )
+                                } else {
+                                    None
+                                }
+                            } else if let (Some(a_dims), Some(b_dims)) =
+                                (a_dims.as_ref(), b_dims.as_ref())
+                            {
+                                let a_has_dynamic =
+                                    a_dims.iter().any(|d| matches!(d, Dimension::Dynamic(_)));
+                                let b_has_dynamic =
+                                    b_dims.iter().any(|d| matches!(d, Dimension::Dynamic(_)));
+                                if a_has_dynamic && !b_has_dynamic {
+                                    Some(a_dims.clone())
+                                } else if b_has_dynamic && !a_has_dynamic {
+                                    Some(b_dims.clone())
+                                } else if a_has_dynamic
+                                    && b_has_dynamic
+                                    && a_dims.len() == b_dims.len()
+                                {
+                                    Some(
+                                        a_dims
+                                            .iter()
+                                            .zip(b_dims.iter())
+                                            .map(|(a_dim, b_dim)| match (a_dim, b_dim) {
+                                                (Dimension::Dynamic(dim), _) => {
+                                                    Dimension::Dynamic(dim.clone())
+                                                }
+                                                (_, Dimension::Dynamic(dim)) => {
+                                                    Dimension::Dynamic(dim.clone())
+                                                }
+                                                (Dimension::Static(v), _) => Dimension::Static(*v),
+                                            })
+                                            .collect(),
+                                    )
+                                } else {
+                                    None
+                                }
+                            } else if let Some(a_dims) = a_dims.as_ref() {
+                                if a_dims.iter().any(|d| matches!(d, Dimension::Dynamic(_)))
+                                    && !is_trivial_static_dimension_vector(a_dims)
+                                {
+                                    Some(a_dims.clone())
+                                } else {
+                                    None
+                                }
+                            } else if let Some(b_dims) = b_dims.as_ref() {
+                                if b_dims.iter().any(|d| matches!(d, Dimension::Dynamic(_)))
+                                    && !is_trivial_static_dimension_vector(b_dims)
+                                {
+                                    Some(b_dims.clone())
+                                } else {
+                                    None
+                                }
+                            } else {
+                                None
+                            };
+
+                            if let Some(out_dims) = out_dims {
+                                if out_dims.iter().any(|d| matches!(d, Dimension::Dynamic(_))) {
+                                    value_shape_dims.insert(out.to_string(), out_dims);
+                                }
+                            }
+                        }
+                    }
                     // Keep Where dynamic to avoid baking shape-driving expressions
                     // (e.g., past_sequence_length + 1) into fixed constants.
                     continue;
@@ -1804,7 +2397,13 @@ Provide --override-dim {}=<value> or enable --experimental-dynamic-inputs.",
         for onnx_node in onnx_graph.node.as_slice() {
             // If all outputs are compile-time constants, emit them directly and skip conversion
             let outputs = onnx_node.output.as_slice();
+            let has_dynamic_output_metadata = outputs.iter().any(|o| {
+                value_shape_dims_for(o.as_str(), &value_shape_dims)
+                    .map(|dims| dims.iter().any(|d| matches!(d, Dimension::Dynamic(_))))
+                    .unwrap_or(false)
+            });
             if !outputs.is_empty()
+                && !has_dynamic_output_metadata
                 && outputs
                     .iter()
                     .all(|o| const_values.contains_key(o.as_str()))
@@ -2612,9 +3211,20 @@ mod tests {
         assert_eq!(shape.len(), 3);
         assert_eq!(shape[0].as_u64(), Some(1));
         assert_eq!(shape[2].as_u64(), Some(4));
+        // The sequence dimension may be a concrete integer (concretized for lowering)
+        // or a dynamic dimension object {"name": ..., "maxSize": N} when dynamic
+        // dimension metadata is propagated.
+        let dim1_ok = shape[1].as_u64().is_some_and(|v| v > 0)
+            || shape[1].as_object().is_some_and(|o| {
+                o.contains_key("name")
+                    && o.get("maxSize")
+                        .and_then(|v| v.as_u64())
+                        .is_some_and(|v| v > 0)
+            });
         assert!(
-            shape[1].as_u64().is_some_and(|v| v > 0),
-            "sequence dimension should be concretized for lowering"
+            dim1_ok,
+            "sequence dimension should be concretized or dynamic for lowering, got: {:?}",
+            shape[1]
         );
     }
 
@@ -2782,6 +3392,461 @@ mod tests {
         assert_eq!(
             reshape_node.options.get("newShape"),
             Some(&serde_json::json!([1, 128, 4]))
+        );
+    }
+
+    #[test]
+    fn test_convert_dynamic_range_lowers_to_slice_and_preserves_dynamic_reshape() {
+        use crate::protos::onnx::{tensor_shape_proto, type_proto};
+        use crate::protos::onnx::{
+            AttributeProto, GraphProto, ModelProto, NodeProto, TensorProto, TensorShapeProto,
+            ValueInfoProto,
+        };
+
+        let seq_dim = tensor_shape_proto::Dimension {
+            value: Some(tensor_shape_proto::dimension::Value::DimParam(
+                "sequence_length".to_string(),
+            )),
+            denotation: String::new(),
+        };
+        let data_shape = TensorShapeProto { dim: vec![seq_dim] };
+
+        let data_tensor_type = type_proto::Tensor {
+            elem_type: TensorProto_DataType::Float.into(),
+            shape: Some(data_shape),
+        };
+        let data_type_proto = crate::protos::onnx::TypeProto {
+            value: Some(type_proto::Value::TensorType(data_tensor_type)),
+            denotation: String::new(),
+        };
+
+        let data_input = ValueInfoProto {
+            name: "data".to_string(),
+            r#type: Some(data_type_proto),
+            ..Default::default()
+        };
+        let output_vi = ValueInfoProto {
+            name: "out".to_string(),
+            ..Default::default()
+        };
+
+        let idx0 = TensorProto {
+            name: "idx0".to_string(),
+            data_type: TensorProto_DataType::Int64 as i32,
+            dims: vec![1],
+            int64_data: vec![0],
+            ..Default::default()
+        };
+        let zero = TensorProto {
+            name: "zero".to_string(),
+            data_type: TensorProto_DataType::Int64 as i32,
+            dims: vec![],
+            int64_data: vec![0],
+            ..Default::default()
+        };
+        let one = TensorProto {
+            name: "one".to_string(),
+            data_type: TensorProto_DataType::Int64 as i32,
+            dims: vec![],
+            int64_data: vec![1],
+            ..Default::default()
+        };
+
+        let shape_node = NodeProto {
+            op_type: "Shape".to_string(),
+            input: vec!["data".to_string()],
+            output: vec!["shape_out".to_string()],
+            ..Default::default()
+        };
+        let gather = NodeProto {
+            op_type: "Gather".to_string(),
+            input: vec!["shape_out".to_string(), "idx0".to_string()],
+            output: vec!["seq_len".to_string()],
+            attribute: vec![AttributeProto {
+                name: "axis".to_string(),
+                i: 0,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let add_limit = NodeProto {
+            op_type: "Add".to_string(),
+            input: vec!["seq_len".to_string(), "one".to_string()],
+            output: vec!["range_limit".to_string()],
+            ..Default::default()
+        };
+        let range = NodeProto {
+            op_type: "Range".to_string(),
+            input: vec![
+                "zero".to_string(),
+                "range_limit".to_string(),
+                "one".to_string(),
+            ],
+            output: vec!["range_out".to_string()],
+            ..Default::default()
+        };
+        let concat_shape = NodeProto {
+            op_type: "Concat".to_string(),
+            input: vec!["range_limit".to_string(), "one".to_string()],
+            output: vec!["shape_for_reshape".to_string()],
+            attribute: vec![AttributeProto {
+                name: "axis".to_string(),
+                i: 0,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let reshape = NodeProto {
+            op_type: "Reshape".to_string(),
+            input: vec!["range_out".to_string(), "shape_for_reshape".to_string()],
+            output: vec!["out".to_string()],
+            ..Default::default()
+        };
+
+        let model = ModelProto {
+            graph: Some(GraphProto {
+                input: vec![data_input],
+                output: vec![output_vi],
+                initializer: vec![idx0, zero, one],
+                node: vec![shape_node, gather, add_limit, range, concat_shape, reshape],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let converter = OnnxConverter::new(model).expect("converter");
+        let graph = converter
+            .convert(&ConvertOptions {
+                optimize: true,
+                experimental_dynamic_inputs: true,
+                extract_weights: false,
+                ..ConvertOptions::default()
+            })
+            .expect("dynamic range path should convert");
+
+        let slice_node = graph
+            .nodes
+            .iter()
+            .find(|n| n.op == "slice")
+            .expect("range should lower to slice");
+        let slice_sizes = slice_node
+            .options
+            .get("sizes")
+            .and_then(|v| v.as_array())
+            .expect("slice sizes should exist");
+        assert_eq!(slice_sizes.len(), 1);
+        let dynamic_size = slice_sizes[0]
+            .as_object()
+            .expect("dynamic range size should be a dimension object");
+        assert_eq!(
+            dynamic_size.get("name").and_then(|v| v.as_str()),
+            Some("sequence_length + 1")
+        );
+        assert_eq!(
+            dynamic_size.get("maxSize").and_then(|v| v.as_u64()),
+            Some(4097)
+        );
+
+        let reshape_node = graph
+            .nodes
+            .iter()
+            .find(|n| n.op == "reshape")
+            .expect("reshape node should exist");
+        let new_shape = reshape_node
+            .options
+            .get("newShape")
+            .and_then(|v| v.as_array())
+            .expect("reshape newShape should exist");
+        assert_eq!(new_shape.len(), 2);
+        assert_eq!(new_shape[1].as_u64(), Some(1));
+        let reshape_dim0 = new_shape[0]
+            .as_object()
+            .expect("reshape dim 0 should stay dynamic");
+        assert_eq!(
+            reshape_dim0.get("name").and_then(|v| v.as_str()),
+            Some("sequence_length + 1")
+        );
+        assert_eq!(
+            reshape_dim0.get("maxSize").and_then(|v| v.as_u64()),
+            Some(4097)
+        );
+    }
+
+    #[test]
+    fn test_convert_dynamic_range_with_dynamic_start_lowers_to_slice_and_add() {
+        use crate::protos::onnx::{tensor_shape_proto, type_proto};
+        use crate::protos::onnx::{
+            AttributeProto, GraphProto, ModelProto, NodeProto, TensorProto, TensorShapeProto,
+            ValueInfoProto,
+        };
+
+        let batch_dim = tensor_shape_proto::Dimension {
+            value: Some(tensor_shape_proto::dimension::Value::DimValue(1)),
+            denotation: String::new(),
+        };
+        let seq_dim = tensor_shape_proto::Dimension {
+            value: Some(tensor_shape_proto::dimension::Value::DimParam(
+                "sequence_length".to_string(),
+            )),
+            denotation: String::new(),
+        };
+        let past_dim = tensor_shape_proto::Dimension {
+            value: Some(tensor_shape_proto::dimension::Value::DimParam(
+                "past_sequence_length".to_string(),
+            )),
+            denotation: String::new(),
+        };
+        let heads_dim = tensor_shape_proto::Dimension {
+            value: Some(tensor_shape_proto::dimension::Value::DimValue(3)),
+            denotation: String::new(),
+        };
+        let head_dim = tensor_shape_proto::Dimension {
+            value: Some(tensor_shape_proto::dimension::Value::DimValue(4)),
+            denotation: String::new(),
+        };
+
+        let ids_shape = TensorShapeProto {
+            dim: vec![batch_dim.clone(), seq_dim.clone()],
+        };
+        let past_shape = TensorShapeProto {
+            dim: vec![batch_dim, heads_dim, past_dim, head_dim],
+        };
+        let range_shape = TensorShapeProto {
+            dim: vec![seq_dim.clone()],
+        };
+        let out_shape = TensorShapeProto {
+            dim: vec![
+                seq_dim,
+                tensor_shape_proto::Dimension {
+                    value: Some(tensor_shape_proto::dimension::Value::DimValue(1)),
+                    denotation: String::new(),
+                },
+            ],
+        };
+
+        let ids_tensor_type = type_proto::Tensor {
+            elem_type: TensorProto_DataType::Int64.into(),
+            shape: Some(ids_shape),
+        };
+        let past_tensor_type = type_proto::Tensor {
+            elem_type: TensorProto_DataType::Float.into(),
+            shape: Some(past_shape),
+        };
+        let range_tensor_type = type_proto::Tensor {
+            elem_type: TensorProto_DataType::Int64.into(),
+            shape: Some(range_shape),
+        };
+        let out_tensor_type = type_proto::Tensor {
+            elem_type: TensorProto_DataType::Int64.into(),
+            shape: Some(out_shape),
+        };
+
+        let ids_input = ValueInfoProto {
+            name: "ids".to_string(),
+            r#type: Some(crate::protos::onnx::TypeProto {
+                value: Some(type_proto::Value::TensorType(ids_tensor_type)),
+                denotation: String::new(),
+            }),
+            ..Default::default()
+        };
+        let past_input = ValueInfoProto {
+            name: "past".to_string(),
+            r#type: Some(crate::protos::onnx::TypeProto {
+                value: Some(type_proto::Value::TensorType(past_tensor_type)),
+                denotation: String::new(),
+            }),
+            ..Default::default()
+        };
+        let range_vi = ValueInfoProto {
+            name: "range_out".to_string(),
+            r#type: Some(crate::protos::onnx::TypeProto {
+                value: Some(type_proto::Value::TensorType(range_tensor_type)),
+                denotation: String::new(),
+            }),
+            ..Default::default()
+        };
+        let out_vi = ValueInfoProto {
+            name: "out".to_string(),
+            r#type: Some(crate::protos::onnx::TypeProto {
+                value: Some(type_proto::Value::TensorType(out_tensor_type)),
+                denotation: String::new(),
+            }),
+            ..Default::default()
+        };
+
+        let idx1 = TensorProto {
+            name: "idx1".to_string(),
+            data_type: TensorProto_DataType::Int64 as i32,
+            dims: vec![1],
+            int64_data: vec![1],
+            ..Default::default()
+        };
+        let idx2 = TensorProto {
+            name: "idx2".to_string(),
+            data_type: TensorProto_DataType::Int64 as i32,
+            dims: vec![1],
+            int64_data: vec![2],
+            ..Default::default()
+        };
+        let one = TensorProto {
+            name: "one".to_string(),
+            data_type: TensorProto_DataType::Int64 as i32,
+            dims: vec![],
+            int64_data: vec![1],
+            ..Default::default()
+        };
+        let reshape_shape = TensorProto {
+            name: "reshape_shape".to_string(),
+            data_type: TensorProto_DataType::Int64 as i32,
+            dims: vec![2],
+            int64_data: vec![4096, 1],
+            ..Default::default()
+        };
+
+        let shape_past = NodeProto {
+            op_type: "Shape".to_string(),
+            input: vec!["past".to_string()],
+            output: vec!["past_shape".to_string()],
+            ..Default::default()
+        };
+        let gather_start = NodeProto {
+            op_type: "Gather".to_string(),
+            input: vec!["past_shape".to_string(), "idx2".to_string()],
+            output: vec!["range_start".to_string()],
+            attribute: vec![AttributeProto {
+                name: "axis".to_string(),
+                i: 0,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let shape_ids = NodeProto {
+            op_type: "Shape".to_string(),
+            input: vec!["ids".to_string()],
+            output: vec!["ids_shape".to_string()],
+            ..Default::default()
+        };
+        let gather_seq = NodeProto {
+            op_type: "Gather".to_string(),
+            input: vec!["ids_shape".to_string(), "idx1".to_string()],
+            output: vec!["seq_len".to_string()],
+            attribute: vec![AttributeProto {
+                name: "axis".to_string(),
+                i: 0,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let add_limit = NodeProto {
+            op_type: "Add".to_string(),
+            input: vec!["range_start".to_string(), "seq_len".to_string()],
+            output: vec!["range_limit".to_string()],
+            ..Default::default()
+        };
+        let range = NodeProto {
+            op_type: "Range".to_string(),
+            input: vec![
+                "range_start".to_string(),
+                "range_limit".to_string(),
+                "one".to_string(),
+            ],
+            output: vec!["range_out".to_string()],
+            ..Default::default()
+        };
+        let reshape = NodeProto {
+            op_type: "Reshape".to_string(),
+            input: vec!["range_out".to_string(), "reshape_shape".to_string()],
+            output: vec!["out".to_string()],
+            ..Default::default()
+        };
+
+        let model = ModelProto {
+            graph: Some(GraphProto {
+                input: vec![ids_input, past_input],
+                output: vec![out_vi.clone()],
+                value_info: vec![range_vi, out_vi],
+                initializer: vec![idx1, idx2, one, reshape_shape],
+                node: vec![
+                    shape_past,
+                    gather_start,
+                    shape_ids,
+                    gather_seq,
+                    add_limit,
+                    range,
+                    reshape,
+                ],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let converter = OnnxConverter::new(model).expect("converter");
+        let graph = converter
+            .convert(&ConvertOptions {
+                optimize: true,
+                experimental_dynamic_inputs: true,
+                extract_weights: false,
+                ..ConvertOptions::default()
+            })
+            .expect("dynamic range with dynamic start should convert");
+
+        assert!(
+            !graph.consts.contains_key("range_out"),
+            "range output should stay runtime-computed"
+        );
+
+        let slice_node = graph
+            .nodes
+            .iter()
+            .find(|n| n.id == "range_out_slice" && n.op == "slice")
+            .expect("range should lower to a slice");
+        let slice_sizes = slice_node
+            .options
+            .get("sizes")
+            .and_then(|v| v.as_array())
+            .expect("slice sizes should exist");
+        let dynamic_size = slice_sizes[0]
+            .as_object()
+            .expect("slice size should be dynamic");
+        assert_eq!(
+            dynamic_size.get("name").and_then(|v| v.as_str()),
+            Some("sequence_length")
+        );
+        assert_eq!(
+            dynamic_size.get("maxSize").and_then(|v| v.as_u64()),
+            Some(4096)
+        );
+
+        let add_node = graph
+            .nodes
+            .iter()
+            .find(|n| n.id == "range_out" && n.op == "add")
+            .expect("dynamic-start range should add the runtime start offset");
+        assert_eq!(add_node.inputs.len(), 2);
+        assert_eq!(add_node.inputs[0], "range_out_slice");
+
+        let reshape_node = graph
+            .nodes
+            .iter()
+            .find(|n| n.op == "reshape")
+            .expect("reshape node should exist");
+        let new_shape = reshape_node
+            .options
+            .get("newShape")
+            .and_then(|v| v.as_array())
+            .expect("reshape newShape should exist");
+        assert_eq!(new_shape.len(), 2);
+        assert_eq!(new_shape[1].as_u64(), Some(1));
+        let reshape_dim0 = new_shape[0]
+            .as_object()
+            .expect("reshape dim 0 should stay dynamic");
+        assert_eq!(
+            reshape_dim0.get("name").and_then(|v| v.as_str()),
+            Some("sequence_length")
+        );
+        assert_eq!(
+            reshape_dim0.get("maxSize").and_then(|v| v.as_u64()),
+            Some(4096)
         );
     }
 
