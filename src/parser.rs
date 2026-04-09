@@ -295,17 +295,27 @@ fn parse_call(p: Pair<Rule>) -> Result<ParsedExpr, ParseError> {
                             first.as_rule()
                         );
                     }
-                    match first.as_rule() {
-                        Rule::value => {
-                            let v = parse_value(first)?;
-                            if let Value::String(s) = v {
-                                inputs.push(s);
-                            } else if let Some(sym) = v.as_str() {
-                                inputs.push(sym.to_string());
+                    // Handle bracketed input lists like `concat([a, b], ...)`: `parse_value`
+                    // returns `Value::Array` for `[a, b]`, which we flatten into individual inputs.                    let v = parse_value(first)?;
+                    match v {
+                        Value::String(s) => inputs.push(s),
+                        Value::Array(arr) => {
+                            for item in arr {
+                                match item {
+                                    Value::String(s) => inputs.push(s),
+                                    other => {
+                                        if let Some(s) = other.as_str() {
+                                            inputs.push(s.to_string());
+                                        }
+                                    }
+                                }
                             }
                         }
-                        Rule::ident => inputs.push(first.as_str().to_string()),
-                        _ => {}
+                        other => {
+                            if let Some(s) = other.as_str() {
+                                inputs.push(s.to_string());
+                            }
+                        }
                     }
                 }
             }
@@ -648,6 +658,27 @@ webnn_graph "test" v1 {
         assert_eq!(node.id, "a");
         assert_eq!(node.op, "split");
         assert_eq!(node.outputs, Some(vec!["a".to_string(), "b".to_string()]));
+    }
+
+    #[test]
+    fn test_parse_concat_bracket_input_list() {
+        let input = r#"
+webnn_graph "model" v1 {
+  inputs {
+    tensors_0: f32[2, 3, 4, 5];
+    tensors_1: f32[2, 3, 4, 5];
+  }
+  nodes {
+    [operand_1] = concat([tensors_0, tensors_1], axis=0);
+  }
+  outputs { operand_1; }
+}
+"#;
+        let graph = parse_wg_text(input).unwrap();
+        let node = &graph.nodes[0];
+        assert_eq!(node.op, "concat");
+        assert_eq!(node.inputs, vec!["tensors_0", "tensors_1"]);
+        assert_eq!(node.options.get("axis").unwrap().as_i64().unwrap(), 0);
     }
 
     #[test]
