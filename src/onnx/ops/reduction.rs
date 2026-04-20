@@ -69,10 +69,8 @@ impl ReductionHandler {
                 "axes" => {
                     axes = Some(attr.ints.clone());
                 }
-                "keepdims" => {
-                    if attr.i != 0 {
-                        keepdims = attr.i;
-                    }
+                "keepdims" if attr.i != 0 => {
+                    keepdims = attr.i;
                 }
                 _ => {}
             }

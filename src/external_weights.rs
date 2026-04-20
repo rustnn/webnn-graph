@@ -80,7 +80,7 @@ fn st_shape_matches_const(st_shape: &[usize], const_shape: &[u32]) -> bool {
 
 /// Convert little-endian BF16 payload to little-endian F32 (WebNN float32 constants).
 fn bf16_bytes_to_f32_le_bytes(data: &[u8]) -> Result<Vec<u8>, WeightResolveError> {
-    if data.len() % 2 != 0 {
+    if !data.len().is_multiple_of(2) {
         return Err(WeightResolveError::Safetensors(format!(
             "BF16 data length {} is not a multiple of 2",
             data.len()

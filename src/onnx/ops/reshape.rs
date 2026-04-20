@@ -1002,10 +1002,8 @@ impl ReshapeHandler {
 
         for attr in node.attribute.as_slice() {
             match attr.name.as_str() {
-                "axis" => {
-                    if attr.i != 0 {
-                        axis = attr.i;
-                    }
+                "axis" if attr.i != 0 => {
+                    axis = attr.i;
                 }
                 "split" => {
                     splits = Some(attr.ints.clone());

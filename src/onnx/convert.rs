@@ -3853,7 +3853,7 @@ mod tests {
     #[test]
     fn test_binary_const_folding_preserves_broadcast_shape() {
         let a = vec![-1];
-        let b = vec![1, 2, 3, 4].repeat(128);
+        let b = [1, 2, 3, 4].repeat(128);
         let a_shape = Vec::<i64>::new();
         let b_shape = vec![1, 128, 4];
         let (out, out_shape) =
@@ -3958,7 +3958,7 @@ mod tests {
         let mul_const = graph.consts.get("mul_out").expect("mul_out const");
         assert_eq!(mul_const.shape, vec![1, 128, 4]);
         assert!(
-            graph.consts.get("eq_out").is_none()
+            !graph.consts.contains_key("eq_out")
                 || graph
                     .consts
                     .get("eq_out")

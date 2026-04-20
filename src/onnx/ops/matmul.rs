@@ -104,25 +104,17 @@ impl MatMulHandler {
 
         for attr in node.attribute.as_slice() {
             match attr.name.as_str() {
-                "alpha" => {
-                    if attr.f != 0.0 {
-                        alpha = attr.f;
-                    }
+                "alpha" if attr.f != 0.0 => {
+                    alpha = attr.f;
                 }
-                "beta" => {
-                    if attr.f != 0.0 {
-                        beta = attr.f;
-                    }
+                "beta" if attr.f != 0.0 => {
+                    beta = attr.f;
                 }
-                "transA" => {
-                    if attr.i != 0 {
-                        trans_a = attr.i != 0;
-                    }
+                "transA" if attr.i != 0 => {
+                    trans_a = attr.i != 0;
                 }
-                "transB" => {
-                    if attr.i != 0 {
-                        trans_b = attr.i != 0;
-                    }
+                "transB" if attr.i != 0 => {
+                    trans_b = attr.i != 0;
                 }
                 _ => {}
             }

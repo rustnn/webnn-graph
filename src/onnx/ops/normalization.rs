@@ -59,15 +59,11 @@ impl NormalizationHandler {
 
         for attr in node.attribute.as_slice() {
             match attr.name.as_str() {
-                "epsilon" => {
-                    if attr.f != 0.0 {
-                        epsilon = attr.f;
-                    }
+                "epsilon" if attr.f != 0.0 => {
+                    epsilon = attr.f;
                 }
-                "axis" => {
-                    if attr.i != 0 {
-                        axis = attr.i;
-                    }
+                "axis" if attr.i != 0 => {
+                    axis = attr.i;
                 }
                 _ => {}
             }
