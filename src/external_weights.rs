@@ -1,4 +1,4 @@
-//! Resolve `@weights` / [`ConstInit::Weights`](crate::ast::ConstInit::Weights) using sidecar files
+//! Resolve `@weights` / [`ConstInit::Weights`] using sidecar files
 //! next to a graph path (SafeTensors or manifest + raw weights blob).
 
 use std::collections::HashMap;
@@ -48,6 +48,12 @@ fn graph_has_external_weight_refs(graph_json: &GraphJson) -> bool {
         .any(|c| matches!(c.init, ConstInit::Weights { .. }))
 }
 
+/// Normalizes tensor / manifest key strings for lookup when graphs use sanitized weight refs.
+#[inline]
+fn sanitize_weight_key(name: &str) -> String {
+    name.replace("::", "__").replace('.', "_")
+}
+
 fn safetensors_st_dtype_matches_ast(st: StDtype, ast: &AstDataType) -> bool {
     matches!(
         (ast, st),
@@ -94,7 +100,7 @@ fn safetensors_sanitized_name_map(
 ) -> Result<HashMap<String, String>, WeightResolveError> {
     let mut out: HashMap<String, String> = HashMap::new();
     for name in st.names() {
-        let sanitized = name.replace("::", "__").replace('.', "_");
+        let sanitized = sanitize_weight_key(name);
         if let Some(prev) = out.insert(sanitized.clone(), name.to_string()) {
             if prev.as_str() != name {
                 return Err(WeightResolveError::Safetensors(format!(
@@ -183,13 +189,11 @@ fn inline_weights_from_safetensors(
             (AstDataType::Float32, StDtype::BF16)
         ) {
             let elem_count: usize = const_decl.shape.iter().map(|&x| x as usize).product();
-            let expected = elem_count
-                .checked_mul(2)
-                .ok_or_else(|| {
-                    WeightResolveError::Safetensors(format!(
-                        "element count overflow for weight `{ref}` (constant `{const_name}`)"
-                    ))
-                })?;
+            let expected = elem_count.checked_mul(2).ok_or_else(|| {
+                WeightResolveError::Safetensors(format!(
+                    "element count overflow for weight `{ref}` (constant `{const_name}`)"
+                ))
+            })?;
             if raw.len() != expected {
                 return Err(WeightResolveError::Safetensors(format!(
                     "BF16 tensor `{ref}` (constant `{const_name}`): byte length {} != expected {} ({} BF16 elements)",
@@ -234,17 +238,6 @@ fn inline_weights_from_safetensors(
     Ok(())
 }
 
-/// Resolve every [`ConstInit::Weights`] in `graph_json` from a specific SafeTensors file.
-///
-/// This matches the SafeTensors branch inside [`resolve_external_weights_for_path`], but
-/// accepts any filesystem path (not only sidecar `model.safetensors` / `{stem}.safetensors`).
-pub fn resolve_weights_from_safetensors_file(
-    graph_json: &mut GraphJson,
-    safetensors_path: &Path,
-) -> Result<(), WeightResolveError> {
-    inline_weights_from_safetensors(graph_json, safetensors_path)
-}
-
 /// Weight manifest JSON next to a graph (supports `webnn-weights-manifest` and related layouts).
 #[derive(Debug, Deserialize)]
 struct FlexibleManifest {
@@ -284,7 +277,7 @@ fn inline_weights_from_manifest(
 
     let mut manifest_by_sanitized: HashMap<String, Vec<FlexibleTensorEntry>> = HashMap::new();
     for (name, entry) in &manifest.tensors {
-        let sanitized = name.replace("::", "__").replace('.', "_");
+        let sanitized = sanitize_weight_key(name);
         manifest_by_sanitized
             .entry(sanitized)
             .or_default()
@@ -343,18 +336,89 @@ fn inline_weights_from_manifest(
     Ok(())
 }
 
+/// Resolves `path_str` relative to the parent directory of `graph_path`, or as an absolute path
+/// when `path_str` is absolute.
+fn resolve_path_relative_to_graph(graph_path: &Path, path_str: &str) -> PathBuf {
+    let p = Path::new(path_str);
+    if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        graph_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join(path_str)
+    }
+}
+
+fn discover_sidecar_manifest(graph_path: &Path) -> Option<PathBuf> {
+    let stem = graph_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or_default();
+    [
+        graph_path.with_file_name("manifest.json"),
+        graph_path.with_file_name(format!("{stem}.manifest.json")),
+    ]
+    .into_iter()
+    .find(|p| p.exists())
+}
+
+fn discover_sidecar_weights(graph_path: &Path) -> Option<PathBuf> {
+    let stem = graph_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or_default();
+    [
+        graph_path.with_file_name("model.weights"),
+        graph_path.with_file_name(format!("{stem}.weights")),
+    ]
+    .into_iter()
+    .find(|p| p.exists())
+}
+
+/// `weights_path` string that names a SafeTensors file (not a raw `.weights` blob).
+fn is_explicit_safetensors_weights_path(path_str: &str) -> bool {
+    path_str.ends_with(".safetensors") || path_str.ends_with(".safetensor")
+}
+
 /// If `graph_json` contains any `ConstInit::Weights` references, load tensors from disk next to
 /// `graph_path` and replace them with [`ConstInit::InlineBytes`].
 ///
-/// Resolution order:
-/// 1. `model.safetensors` or `{stem}.safetensors` (stem = `graph_path` file stem)
-/// 2. Else `manifest.json` or `{stem}.manifest.json` together with `model.weights` or `{stem}.weights`
+/// ## Phases
 ///
-/// Returns [`WeightResolveError::Missing`] when weight refs exist but neither source is available.
-pub fn resolve_external_weights_for_path(
-    graph_path: &Path,
+/// 1. **No-op.** If the graph has no [`ConstInit::Weights`] initializers, return `Ok(())` without
+///    reading the filesystem. Optional path arguments are ignored in this case.
+///
+/// 2. **SafeTensors (preferred).** First, if `weights_path` is `Some` and ends with `.safetensors` /
+///    `.safetensor`, resolve that path (relative to the graph’s directory) and load it when it exists.
+///    If all weight refs are satisfied, return `Ok(())`. If some refs remain, continue. If the path
+///    does not exist, return [`WeightResolveError::Missing`]. Then look next to `graph_path` for
+///    `model.safetensors` then `{stem}.safetensors` and load the first that exists (same return
+///    semantics as today). `manifest_path` is not used in this phase.
+///
+/// 3. **Manifest + binary blob.** Resolve a manifest path and a weights path, then read tensor
+///    slices from the blob according to the manifest and replace each `ConstInit::Weights` with inline
+///    bytes.
+///    - For each of `manifest_path` and `weights_path`: if `Some`, resolve the string relative to the
+///      graph’s directory (or use an absolute path as-is) and require that path to exist, or return
+///      [`WeightResolveError::Missing`]. If `None`, search for a sidecar file: manifest candidates are
+///      `manifest.json` and `{stem}.manifest.json`; weights candidates are `model.weights` and
+///      `{stem}.weights` (first existing file wins per side).
+///    - If both resolved paths exist, load manifest JSON + blob bytes and apply them to the graph,
+///      then return.
+///    - If either path is still missing, return [`WeightResolveError::Missing`] describing the graph
+///      path and expected sidecar names (explicit paths get their own missing-path errors in the
+///      `Some` branches above).
+///
+/// Relative path strings are resolved against the parent directory of `graph_path`; absolute paths are
+/// used as-is.
+pub fn resolve_external_weights(
     graph_json: &mut GraphJson,
+    graph_path: &Path,
+    weights_path: Option<&str>,
+    manifest_path: Option<&str>,
 ) -> Result<(), WeightResolveError> {
+    // Phase 1: nothing to load.
     if !graph_has_external_weight_refs(graph_json) {
         return Ok(());
     }
@@ -364,6 +428,7 @@ pub fn resolve_external_weights_for_path(
         .and_then(|s| s.to_str())
         .unwrap_or_default();
 
+    // Phase 2: prefer SafeTensors next to the graph (`manifest_path` / `weights_path` ignored here).
     let safetensors_candidates = [
         graph_path.with_file_name("model.safetensors"),
         graph_path.with_file_name(format!("{stem}.safetensors")),
@@ -372,28 +437,47 @@ pub fn resolve_external_weights_for_path(
         return inline_weights_from_safetensors(graph_json, &p);
     }
 
-    let manifest_path = [
-        graph_path.with_file_name("manifest.json"),
-        graph_path.with_file_name(format!("{stem}.manifest.json")),
-    ]
-    .into_iter()
-    .find(|p| p.exists());
+    // Phase 3a: manifest path — explicit string or sidecar discovery.
+    let resolved_manifest: Option<PathBuf> = match manifest_path {
+        Some(s) => {
+            let p = resolve_path_relative_to_graph(graph_path, s);
+            if p.exists() {
+                Some(p)
+            } else {
+                return Err(WeightResolveError::Missing(format!(
+                    "explicit manifest path `{}` does not exist (from `{s}`)",
+                    p.display()
+                )));
+            }
+        }
+        None => discover_sidecar_manifest(graph_path),
+    };
 
-    let weights_path = [
-        graph_path.with_file_name("model.weights"),
-        graph_path.with_file_name(format!("{stem}.weights")),
-    ]
-    .into_iter()
-    .find(|p| p.exists());
+    // Phase 3b: weights blob path — explicit string or sidecar discovery.
+    let resolved_weights: Option<PathBuf> = match weights_path {
+        Some(s) => {
+            let p = resolve_path_relative_to_graph(graph_path, s);
+            if p.exists() {
+                Some(p)
+            } else {
+                return Err(WeightResolveError::Missing(format!(
+                    "explicit weights path `{}` does not exist (from `{s}`)",
+                    p.display()
+                )));
+            }
+        }
+        None => discover_sidecar_weights(graph_path),
+    };
 
-    match (manifest_path, weights_path) {
+    // Phase 3c: need both files for manifest+blob inlining; otherwise report missing source.
+    match (resolved_manifest, resolved_weights) {
         (Some(manifest_path), Some(weights_path)) => {
             inline_weights_from_manifest(graph_json, &manifest_path, &weights_path)
         }
         _ => Err(WeightResolveError::Missing(format!(
             "graph references external weights (@weights) but no weight source was found next to `{}`. \
              Expected `model.safetensors` or `{stem}.safetensors`, or `manifest.json` / `{stem}.manifest.json` \
-             together with `model.weights` / `{stem}.weights`.",
+             together with `model.weights` / `{stem}.weights` (or pass explicit manifest/weights paths).",
             graph_path.display()
         ))),
     }
@@ -460,7 +544,62 @@ mod tests {
         std::fs::write(&weights_path, &weights_data).unwrap();
 
         let mut graph: GraphJson = serde_json::from_str(graph_content).unwrap();
-        resolve_external_weights_for_path(&graph_path, &mut graph).unwrap();
+        resolve_external_weights(&mut graph, &graph_path, None, None).unwrap();
+        match &graph.consts["weight"].init {
+            ConstInit::InlineBytes { bytes } => assert_eq!(bytes.len(), 8),
+            other => panic!("expected inline bytes, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn explicit_manifest_and_weights_paths() {
+        let temp_dir = TempDir::new().unwrap();
+        let graph_path = temp_dir.path().join("model.json");
+        let manifest_path = temp_dir.path().join("custom.manifest.json");
+        let weights_path = temp_dir.path().join("blob.weights");
+
+        let graph_content = r#"{
+            "format": "webnn-graph-json",
+            "version": 1,
+            "inputs": { "x": { "dataType": "float32", "shape": [2] } },
+            "consts": {
+                "weight": {
+                    "dataType": "float32",
+                    "shape": [2],
+                    "init": { "kind": "weights", "ref": "weight" }
+                }
+            },
+            "nodes": [],
+            "outputs": { "y": "x" }
+        }"#;
+
+        let manifest_content = r#"{
+            "format": "webnn-weights-manifest",
+            "version": 1,
+            "endianness": "little",
+            "tensors": {
+                "weight": {
+                    "dataType": "float32",
+                    "shape": [2],
+                    "byteOffset": 0,
+                    "byteLength": 8
+                }
+            }
+        }"#;
+
+        let weights_data: Vec<u8> = vec![0x00, 0x00, 0x80, 0x3f, 0x00, 0x00, 0x00, 0x40];
+        std::fs::write(&graph_path, graph_content).unwrap();
+        std::fs::write(&manifest_path, manifest_content).unwrap();
+        std::fs::write(&weights_path, &weights_data).unwrap();
+
+        let mut graph: GraphJson = serde_json::from_str(graph_content).unwrap();
+        resolve_external_weights(
+            &mut graph,
+            &graph_path,
+            Some("blob.weights"),
+            Some("custom.manifest.json"),
+        )
+        .unwrap();
         match &graph.consts["weight"].init {
             ConstInit::InlineBytes { bytes } => assert_eq!(bytes.len(), 8),
             other => panic!("expected inline bytes, got {:?}", other),
@@ -493,7 +632,7 @@ mod tests {
         write_safetensors_f32(&st_path, "weight", vec![2], &tensor_bytes);
 
         let mut graph: GraphJson = serde_json::from_str(graph_content).unwrap();
-        resolve_external_weights_for_path(&graph_path, &mut graph).unwrap();
+        resolve_external_weights(&mut graph, &graph_path, None, None).unwrap();
         match &graph.consts["weight"].init {
             ConstInit::InlineBytes { bytes } => assert_eq!(bytes, &tensor_bytes),
             other => panic!("expected inline bytes, got {:?}", other),
@@ -540,7 +679,7 @@ mod tests {
         std::fs::write(&weights_path, vec![0u8; 8]).unwrap();
 
         let mut graph: GraphJson = serde_json::from_str(graph_content).unwrap();
-        let err = resolve_external_weights_for_path(&graph_path, &mut graph).unwrap_err();
+        let err = resolve_external_weights(&mut graph, &graph_path, None, None).unwrap_err();
         assert!(matches!(err, WeightResolveError::Manifest(_)));
     }
 
@@ -578,7 +717,7 @@ mod tests {
         );
 
         let mut graph: GraphJson = serde_json::from_str(graph_content).unwrap();
-        resolve_external_weights_for_path(&graph_path, &mut graph).unwrap();
+        resolve_external_weights(&mut graph, &graph_path, None, None).unwrap();
     }
 
     #[test]
@@ -612,7 +751,7 @@ mod tests {
         write_safetensors_bf16(&st_path, "weight", vec![2], &bf16_bytes);
 
         let mut graph: GraphJson = serde_json::from_str(graph_content).unwrap();
-        resolve_external_weights_for_path(&graph_path, &mut graph).unwrap();
+        resolve_external_weights(&mut graph, &graph_path, None, None).unwrap();
 
         let expected: Vec<u8> = [1.0f32, 2.0f32]
             .iter()
