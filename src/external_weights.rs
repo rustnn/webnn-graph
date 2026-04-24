@@ -13,6 +13,15 @@ use thiserror::Error;
 
 use crate::ast::{ConstInit, DataType as AstDataType, GraphJson};
 
+/// Default graph JSON basename (typical sidecar layout next to weights / manifest).
+pub const DEFAULT_PATH_JSON: &str = "model.json";
+/// Default raw weights blob basename when not using a stem-prefixed `*.weights` file.
+pub const DEFAULT_PATH_WEIGHTS: &str = "model.weights";
+/// Default SafeTensors archive basename when not using a stem-prefixed `*.safetensors` file.
+pub const DEFAULT_PATH_SAFETENSORS: &str = "model.safetensors";
+/// Default weights manifest basename when not using a stem-prefixed `*.manifest.json` file.
+pub const DEFAULT_PATH_MANIFEST: &str = "manifest.json";
+
 /// Failure while resolving external weights for a [`GraphJson`].
 #[derive(Debug, Error)]
 pub enum WeightResolveError {
@@ -356,25 +365,25 @@ fn discover_sidecar_manifest(graph_path: &Path) -> Option<PathBuf> {
         .and_then(|s| s.to_str())
         .unwrap_or_default();
     [
-        graph_path.with_file_name("manifest.json"),
         graph_path.with_file_name(format!("{stem}.manifest.json")),
+        graph_path.with_file_name(DEFAULT_PATH_MANIFEST),
     ]
     .into_iter()
     .find(|p| p.exists())
 }
 
-/// Discovers a single weights file next to `graph_path`: SafeTensors sidecars, then `{stem}.weights`,
-/// then `model.weights`.
+/// Discovers a single weights file next to `graph_path`: SafeTensors sidecars ([`MODEL_SAFETENSORS`],
+/// `{stem}.safetensors`), then `{stem}.weights`, then [`MODEL_WEIGHTS`].
 fn discover_weights_file(graph_path: &Path) -> Option<PathBuf> {
     let stem = graph_path
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or_default();
     [
-        graph_path.with_file_name("model.safetensors"),
         graph_path.with_file_name(format!("{stem}.safetensors")),
         graph_path.with_file_name(format!("{stem}.weights")),
-        graph_path.with_file_name("model.weights"),
+        graph_path.with_file_name(DEFAULT_PATH_SAFETENSORS),
+        graph_path.with_file_name(DEFAULT_PATH_WEIGHTS),
     ]
     .into_iter()
     .find(|p| p.exists())
@@ -398,15 +407,15 @@ fn path_looks_like_safetensors(path: &Path) -> bool {
 /// 2. **Resolve weights path** (discovery is separate from loading):
 ///    - If `weights_path` is set: resolve relative to the graph’s directory (or absolute as-is); the file
 ///      must exist or return [`WeightResolveError::Missing`].
-///    - Else: [`discover_weights_file`] searches next to the graph in order: `model.safetensors`,
-///      `{stem}.safetensors`, `{stem}.weights`, `model.weights`. If none exist, return
+///    - Else: [`discover_weights_file`] searches next to the graph in order: [`MODEL_SAFETENSORS`],
+///      `{stem}.safetensors`, `{stem}.weights`, [`MODEL_WEIGHTS`]. If none exist, return
 ///      [`WeightResolveError::Missing`].
 ///
 /// 3. **Load by kind:**
 ///    - If the weights path is SafeTensors → [`inline_weights_from_safetensors`] and return (any
 ///      `manifest_path` is ignored).
 ///    - Otherwise it is a binary blob → resolve manifest: explicit `manifest_path` must exist, or
-///      [`discover_sidecar_manifest`] must find `manifest.json` / `{stem}.manifest.json`, else
+///      [`discover_sidecar_manifest`] must find [`MANIFEST_JSON`] / `{stem}.manifest.json`, else
 ///      [`WeightResolveError::Missing`]. Then [`inline_weights_from_manifest`].
 ///
 /// Incomplete SafeTensors resolution returns [`WeightResolveError::Safetensors`]; manifest errors use
@@ -417,6 +426,13 @@ pub fn resolve_external_weights(
     weights_path: Option<&str>,
     manifest_path: Option<&str>,
 ) -> Result<(), WeightResolveError> {
+    eprintln!(
+        "[webnn graph] resolve external weights: graph={}, weights_path={}, manifest_path={}",
+        graph_path.display(),
+        weights_path.unwrap_or("<discover next to graph>"),
+        manifest_path.unwrap_or("<discover next to graph>"),
+    );
+
     if !graph_has_external_weight_refs(graph_json) {
         return Ok(());
     }
@@ -438,8 +454,8 @@ pub fn resolve_external_weights(
     } else {
         discover_weights_file(graph_path).ok_or_else(|| {
             WeightResolveError::Missing(format!(
-                "no weights file found next to `{0}`; expected `model.safetensors`, `{1}.safetensors`, \
-                 `{1}.weights`, or `model.weights`, or pass `weights_path`",
+                "no weights file found next to `{0}`; expected `{DEFAULT_PATH_SAFETENSORS}`, `{1}.safetensors`, \
+                 `{1}.weights`, or `{DEFAULT_PATH_WEIGHTS}`, or pass `weights_path`",
                 graph_path.display(),
                 stem,
             ))
@@ -462,7 +478,7 @@ pub fn resolve_external_weights(
     } else {
         discover_sidecar_manifest(graph_path).ok_or_else(|| {
             WeightResolveError::Missing(format!(
-                "weights blob `{0}` requires a manifest; pass `manifest_path` or place `manifest.json` / \
+                "weights blob `{0}` requires a manifest; pass `manifest_path` or place `{DEFAULT_PATH_MANIFEST}` / \
                  `{1}.manifest.json` next to `{2}`",
                 wp.display(),
                 stem,
@@ -496,9 +512,9 @@ mod tests {
     #[test]
     fn manifest_and_weights_inline() {
         let temp_dir = TempDir::new().unwrap();
-        let graph_path = temp_dir.path().join("model.json");
+        let graph_path = temp_dir.path().join(DEFAULT_PATH_JSON);
         let manifest_path = temp_dir.path().join("model.manifest.json");
-        let weights_path = temp_dir.path().join("model.weights");
+        let weights_path = temp_dir.path().join(DEFAULT_PATH_WEIGHTS);
 
         let graph_content = r#"{
             "format": "webnn-graph-json",
@@ -545,7 +561,7 @@ mod tests {
     #[test]
     fn explicit_manifest_and_weights_paths() {
         let temp_dir = TempDir::new().unwrap();
-        let graph_path = temp_dir.path().join("model.json");
+        let graph_path = temp_dir.path().join(DEFAULT_PATH_JSON);
         let manifest_path = temp_dir.path().join("custom.manifest.json");
         let weights_path = temp_dir.path().join("blob.weights");
 
@@ -600,7 +616,7 @@ mod tests {
     #[test]
     fn explicit_safetensors_weights_path() {
         let temp_dir = TempDir::new().unwrap();
-        let graph_path = temp_dir.path().join("model.json");
+        let graph_path = temp_dir.path().join(DEFAULT_PATH_JSON);
         let st_path = temp_dir.path().join("custom.safetensors");
 
         let graph_content = r#"{
@@ -634,7 +650,7 @@ mod tests {
     #[test]
     fn manifest_arg_ignored_when_weights_path_is_safetensors() {
         let temp_dir = TempDir::new().unwrap();
-        let graph_path = temp_dir.path().join("model.json");
+        let graph_path = temp_dir.path().join(DEFAULT_PATH_JSON);
         let st_path = temp_dir.path().join("weights.safetensors");
 
         let graph_content = r#"{
@@ -673,8 +689,8 @@ mod tests {
     #[test]
     fn safetensors_inline() {
         let temp_dir = TempDir::new().unwrap();
-        let graph_path = temp_dir.path().join("model.json");
-        let st_path = temp_dir.path().join("model.safetensors");
+        let graph_path = temp_dir.path().join(DEFAULT_PATH_JSON);
+        let st_path = temp_dir.path().join(DEFAULT_PATH_SAFETENSORS);
 
         let graph_content = r#"{
             "format": "webnn-graph-json",
@@ -706,9 +722,9 @@ mod tests {
     #[test]
     fn out_of_bounds_manifest_errors() {
         let temp_dir = TempDir::new().unwrap();
-        let graph_path = temp_dir.path().join("model.json");
-        let manifest_path = temp_dir.path().join("manifest.json");
-        let weights_path = temp_dir.path().join("model.weights");
+        let graph_path = temp_dir.path().join(DEFAULT_PATH_JSON);
+        let manifest_path = temp_dir.path().join(DEFAULT_PATH_MANIFEST);
+        let weights_path = temp_dir.path().join(DEFAULT_PATH_WEIGHTS);
 
         let graph_content = r#"{
             "format": "webnn-graph-json",
@@ -750,10 +766,10 @@ mod tests {
     #[test]
     fn safetensors_preferred_over_invalid_manifest() {
         let temp_dir = TempDir::new().unwrap();
-        let graph_path = temp_dir.path().join("model.json");
-        let manifest_path = temp_dir.path().join("manifest.json");
-        let weights_path = temp_dir.path().join("model.weights");
-        let st_path = temp_dir.path().join("model.safetensors");
+        let graph_path = temp_dir.path().join(DEFAULT_PATH_JSON);
+        let manifest_path = temp_dir.path().join(DEFAULT_PATH_MANIFEST);
+        let weights_path = temp_dir.path().join(DEFAULT_PATH_WEIGHTS);
+        let st_path = temp_dir.path().join(DEFAULT_PATH_SAFETENSORS);
 
         let graph_content = r#"{
             "format": "webnn-graph-json",
@@ -789,8 +805,8 @@ mod tests {
         use half::bf16;
 
         let temp_dir = TempDir::new().unwrap();
-        let graph_path = temp_dir.path().join("model.json");
-        let st_path = temp_dir.path().join("model.safetensors");
+        let graph_path = temp_dir.path().join(DEFAULT_PATH_JSON);
+        let st_path = temp_dir.path().join(DEFAULT_PATH_SAFETENSORS);
 
         let graph_content = r#"{
             "format": "webnn-graph-json",
