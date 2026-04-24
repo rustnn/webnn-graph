@@ -372,8 +372,8 @@ fn discover_sidecar_manifest(graph_path: &Path) -> Option<PathBuf> {
     .find(|p| p.exists())
 }
 
-/// Discovers a single weights file next to `graph_path`: SafeTensors sidecars ([`MODEL_SAFETENSORS`],
-/// `{stem}.safetensors`), then `{stem}.weights`, then [`MODEL_WEIGHTS`].
+/// Discovers a single weights file next to `graph_path`, in order: `{stem}.safetensors`,
+/// `{stem}.weights`, [`DEFAULT_PATH_SAFETENSORS`], [`DEFAULT_PATH_WEIGHTS`].
 fn discover_weights_file(graph_path: &Path) -> Option<PathBuf> {
     let stem = graph_path
         .file_stem()
@@ -407,15 +407,15 @@ fn path_looks_like_safetensors(path: &Path) -> bool {
 /// 2. **Resolve weights path** (discovery is separate from loading):
 ///    - If `weights_path` is set: resolve relative to the graph’s directory (or absolute as-is); the file
 ///      must exist or return [`WeightResolveError::Missing`].
-///    - Else: [`discover_weights_file`] searches next to the graph in order: [`MODEL_SAFETENSORS`],
-///      `{stem}.safetensors`, `{stem}.weights`, [`MODEL_WEIGHTS`]. If none exist, return
+///    - Else: [`discover_weights_file`] searches next to the graph in order: `{stem}.safetensors`,
+///      `{stem}.weights`, [`DEFAULT_PATH_SAFETENSORS`], [`DEFAULT_PATH_WEIGHTS`]. If none exist, return
 ///      [`WeightResolveError::Missing`].
 ///
 /// 3. **Load by kind:**
 ///    - If the weights path is SafeTensors → [`inline_weights_from_safetensors`] and return (any
 ///      `manifest_path` is ignored).
 ///    - Otherwise it is a binary blob → resolve manifest: explicit `manifest_path` must exist, or
-///      [`discover_sidecar_manifest`] must find [`MANIFEST_JSON`] / `{stem}.manifest.json`, else
+///      [`discover_sidecar_manifest`] must find `{stem}.manifest.json` / [`DEFAULT_PATH_MANIFEST`], else
 ///      [`WeightResolveError::Missing`]. Then [`inline_weights_from_manifest`].
 ///
 /// Incomplete SafeTensors resolution returns [`WeightResolveError::Safetensors`]; manifest errors use
@@ -454,8 +454,8 @@ pub fn resolve_external_weights(
     } else {
         discover_weights_file(graph_path).ok_or_else(|| {
             WeightResolveError::Missing(format!(
-                "no weights file found next to `{0}`; expected `{DEFAULT_PATH_SAFETENSORS}`, `{1}.safetensors`, \
-                 `{1}.weights`, or `{DEFAULT_PATH_WEIGHTS}`, or pass `weights_path`",
+                "no weights file found next to `{0}`; expected `{1}.safetensors`, `{1}.weights`, \
+                 `{DEFAULT_PATH_SAFETENSORS}`, or `{DEFAULT_PATH_WEIGHTS}`, or pass `weights_path`",
                 graph_path.display(),
                 stem,
             ))
@@ -478,8 +478,8 @@ pub fn resolve_external_weights(
     } else {
         discover_sidecar_manifest(graph_path).ok_or_else(|| {
             WeightResolveError::Missing(format!(
-                "weights blob `{0}` requires a manifest; pass `manifest_path` or place `{DEFAULT_PATH_MANIFEST}` / \
-                 `{1}.manifest.json` next to `{2}`",
+                "weights blob `{0}` requires a manifest; pass `manifest_path` or place `{1}.manifest.json` / \
+                 `{DEFAULT_PATH_MANIFEST}` next to `{2}`",
                 wp.display(),
                 stem,
                 graph_path.display()
