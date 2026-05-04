@@ -1,10 +1,12 @@
 use clap::{Parser, Subcommand};
 use std::fs;
+#[cfg(feature = "onnx")]
 use std::path::Path;
 
 use webnn_graph::ast::GraphJson;
 use webnn_graph::emit_html::emit_html;
 use webnn_graph::emit_js::{emit_builder_js, emit_weights_loader_js};
+#[cfg(feature = "onnx")]
 use webnn_graph::onnx::convert::{convert_onnx, ConvertOptions};
 use webnn_graph::parser::parse_wg_text;
 use webnn_graph::serialize::serialize_graph_to_wg_text;
@@ -94,6 +96,7 @@ enum Command {
         #[arg(long)]
         output: String,
     },
+    #[cfg(feature = "onnx")]
     ConvertOnnx {
         /// Input ONNX model file (.onnx)
         #[arg(long)]
@@ -256,6 +259,7 @@ fn main() -> anyhow::Result<()> {
             fs::write(&output, json)?;
             eprintln!("Wrote graph with inline weights to: {}", output);
         }
+        #[cfg(feature = "onnx")]
         Command::ConvertOnnx {
             input,
             output,
