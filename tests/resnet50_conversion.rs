@@ -1,3 +1,4 @@
+#![cfg(feature = "onnx")]
 //! End-to-end conversion test for ResNet-50 (ONNX Model Zoo).
 //!
 //! The downloaded model is cached at `target/test-data/resnet50_Opset16.onnx`.

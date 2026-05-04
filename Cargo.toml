@@ -15,7 +15,7 @@ path = "src/main.rs"
 
 [features]
 default = ["onnx"]
-onnx = ["dep:webnn-onnx-utils"]
+onnx = ["dep:webnn-onnx-utils", "dep:prost"]
 
 [dependencies]
 anyhow = "1.0"
@@ -28,7 +28,7 @@ pest = "2.7"
 pest_derive = "2.7"
 clap = { version = "4.5", features = ["derive"] }
 base64 = "0.22"
-prost = "0.12"
+prost = { version = "0.12", optional = true }
 webnn-onnx-utils = { git = "https://github.com/rustnn/webnn-onnx-utils", branch = "main", optional = true }
 
 [dev-dependencies]

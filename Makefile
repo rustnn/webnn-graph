@@ -1,23 +1,29 @@
-.PHONY: all build test fmt clean run check lint help parse validate emit-js emit-html coverage
+.PHONY: all build test fmt clean run check lint help parse validate emit-js emit-html coverage minimal
+
+CARGO_FLAGS ?=
 
 # Default target
 all: build
 
 # Build the project
 build:
-	cargo build
+	cargo build $(CARGO_FLAGS)
+
+# Build with --no-default-features
+minimal:
+	cargo build --no-default-features
 
 # Build with release optimizations
 release:
-	cargo build --release
+	cargo build --release $(CARGO_FLAGS)
 
 # Run all tests
 test:
-	cargo test
+	cargo test $(CARGO_FLAGS)
 
 # Run tests with output
 test-verbose:
-	cargo test -- --nocapture
+	cargo test $(CARGO_FLAGS) -- --nocapture
 
 # Format code
 fmt:
@@ -29,11 +35,11 @@ fmt-check:
 
 # Run clippy linter
 lint:
-	cargo clippy -- -D warnings
+	cargo clippy $(CARGO_FLAGS) -- -D warnings
 
 # Quick compile check without building
 check:
-	cargo check
+	cargo check $(CARGO_FLAGS)
 
 # Clean build artifacts
 clean:
@@ -41,25 +47,25 @@ clean:
 
 # Run the CLI tool (parse example)
 run:
-	cargo run --bin webnn-graph -- parse examples/resnet_head.webnn
+	cargo run $(CARGO_FLAGS) --bin webnn-graph -- parse examples/resnet_head.webnn
 
 # Parse example graph
 parse:
-	cargo run --bin webnn-graph -- parse examples/resnet_head.webnn
+	cargo run $(CARGO_FLAGS) --bin webnn-graph -- parse examples/resnet_head.webnn
 
 # Validate example graph
 validate:
-	cargo run --bin webnn-graph -- parse examples/resnet_head.webnn > /tmp/graph.json && \
-	cargo run --bin webnn-graph -- validate /tmp/graph.json --weights-manifest examples/weights.manifest.json
+	cargo run $(CARGO_FLAGS) --bin webnn-graph -- parse examples/resnet_head.webnn > /tmp/graph.json && \
+	cargo run $(CARGO_FLAGS) --bin webnn-graph -- validate /tmp/graph.json --weights-manifest examples/weights.manifest.json
 
 # Emit JavaScript for example graph
 emit-js:
-	cargo run --bin webnn-graph -- parse examples/resnet_head.webnn > /tmp/graph.json && \
-	cargo run --bin webnn-graph -- emit-js /tmp/graph.json
+	cargo run $(CARGO_FLAGS) --bin webnn-graph -- parse examples/resnet_head.webnn > /tmp/graph.json && \
+	cargo run $(CARGO_FLAGS) --bin webnn-graph -- emit-js /tmp/graph.json
 
 # Generate HTML visualizer for example graph
 emit-html:
-	cargo run --bin webnn-graph -- emit-html examples/resnet_head.webnn > /tmp/webnn_viz.html
+	cargo run $(CARGO_FLAGS) --bin webnn-graph -- emit-html examples/resnet_head.webnn > /tmp/webnn_viz.html
 	@echo "Visualizer generated: /tmp/webnn_viz.html"
 	@echo "Open it with: open /tmp/webnn_viz.html"
 

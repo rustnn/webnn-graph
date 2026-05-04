@@ -12,12 +12,15 @@ env:
 
 jobs:
   test:
-    name: Test on ${{ matrix.os }}
+    name: Test (${{ matrix.os }}, minimal=${{ matrix.minimal }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
+        minimal: [true, false]
+    env:
+      CARGO_FLAGS: ${{ matrix.minimal && '--no-default-features' || '' }}
 
     steps:
       - name: Checkout code
@@ -29,42 +32,42 @@ jobs:
           components: rustfmt, clippy
 
       - name: Install protoc (Linux)
-        if: runner.os == 'Linux'
+        if: ${{ runner.os == 'Linux' && !matrix.minimal }}
         run: |
           sudo apt-get update
           sudo apt-get install -y protobuf-compiler
 
       - name: Install protoc (macOS)
-        if: runner.os == 'macOS'
+        if: ${{ runner.os == 'macOS' && !matrix.minimal }}
         run: brew install protobuf
 
       - name: Install protoc (Windows)
-        if: runner.os == 'Windows'
+        if: ${{ runner.os == 'Windows' && !matrix.minimal }}
         run: choco install protoc
 
       - name: Cache cargo registry
         uses: actions/cache@v4
         with:
           path: ~/.cargo/registry
-          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-${{ matrix.minimal }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-registry-
+            ${{ runner.os }}-${{ matrix.minimal }}-cargo-registry-
 
       - name: Cache cargo index
         uses: actions/cache@v4
         with:
           path: ~/.cargo/git
-          key: ${{ runner.os }}-cargo-git-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-${{ matrix.minimal }}-cargo-git-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-git-
+            ${{ runner.os }}-${{ matrix.minimal }}-cargo-git-
 
       - name: Cache target directory
         uses: actions/cache@v4
         with:
           path: target
-          key: ${{ runner.os }}-target-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-${{ matrix.minimal }}-target-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-target-
+            ${{ runner.os }}-${{ matrix.minimal }}-target-
 
       # Cache the ResNet-50 ONNX model separately so it survives Cargo.lock churn
       # and is not evicted as collateral damage when the target/ cache is invalidated.
