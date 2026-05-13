@@ -10,7 +10,7 @@ allowing graphs to be expressed declaratively and reused across tooling.
 The project also implements a Netron-like **WebNN graph visualizer** that
 allows for interactive exploration of graph structure.
 
-Check it out at [https://blog.ziade.org/webnn-graph](https://blog.ziade.org/webnn-graph)
+Check it out at [https://rustnn.github.io/webnn-graph/](https://rustnn.github.io/webnn-graph/)
 
 ## Development
 
