@@ -9,6 +9,7 @@ use std::sync::OnceLock;
 pub mod activation;
 pub mod comparison;
 pub mod conditional;
+pub mod conv;
 pub mod conversion;
 pub mod elementwise;
 pub mod matmul;
@@ -21,6 +22,7 @@ pub mod utility;
 use activation::ActivationHandler;
 use comparison::ComparisonHandler;
 use conditional::ConditionalHandler;
+use conv::ConvHandler;
 use conversion::ConversionHandler;
 use elementwise::ElementwiseHandler;
 use matmul::MatMulHandler;
@@ -150,6 +152,7 @@ impl OpRegistry {
     pub fn new() -> Self {
         let handlers: Vec<Box<dyn OpHandler>> = vec![
             Box::new(MatMulHandler),
+            Box::new(ConvHandler),
             Box::new(ElementwiseHandler),
             Box::new(ComparisonHandler),
             Box::new(ConditionalHandler),
