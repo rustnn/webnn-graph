@@ -23,6 +23,7 @@ impl OpHandler for ReshapeHandler {
                 | "Squeeze"
                 | "Tile"
                 | "Expand"
+                | "Flatten"
         )
     }
 
@@ -47,6 +48,7 @@ impl OpHandler for ReshapeHandler {
             "Squeeze" => self.convert_squeeze(node, &node_name, context),
             "Tile" => self.convert_tile(node, &node_name, context),
             "Expand" => self.convert_expand(node, &node_name, context),
+            "Flatten" => self.convert_flatten(node, &node_name, context),
             _ => Err(OnnxError::UnsupportedOp {
                 op: op_type.to_string(),
                 node: node_name,
@@ -1290,6 +1292,94 @@ impl ReshapeHandler {
                 result
                     .output_types
                     .insert(output.to_string(), dtype.clone());
+            }
+        }
+
+        Ok(result)
+    }
+
+    /// Convert ONNX Flatten to WebNN reshape.
+    ///
+    /// ONNX Flatten reshapes the input to a 2-D matrix `(d_0 * ... * d_{axis-1},
+    /// d_axis * ... * d_{n-1})` where `axis` defaults to 1 and may be negative.
+    fn convert_flatten(
+        &self,
+        node: &NodeProto,
+        node_name: &str,
+        context: &ConversionContext,
+    ) -> Result<ConversionResult, OnnxError> {
+        let inputs = node.input.as_slice();
+        if inputs.len() != 1 {
+            return Err(OnnxError::InvalidShape(format!(
+                "Flatten expects 1 input, got {}",
+                inputs.len()
+            )));
+        }
+
+        let mut axis: i64 = 1;
+        for attr in node.attribute.as_slice() {
+            if attr.name.as_str() == "axis" {
+                axis = attr.i;
+                break;
+            }
+        }
+
+        let output_name = if node.output.as_slice().is_empty() {
+            format!("{}_output", node_name)
+        } else {
+            sanitize_identifier(&node.output.as_slice()[0].to_string())
+        };
+
+        let input_raw = inputs[0].to_string();
+        let input_id = context.resolve_input(&input_raw);
+        let input_shape = context
+            .value_shapes
+            .get(&input_raw)
+            .or_else(|| context.value_shapes.get(&sanitize_identifier(&input_raw)))
+            .cloned()
+            .ok_or_else(|| {
+                OnnxError::InvalidShape(format!("Flatten: input '{}' shape is unknown", input_raw))
+            })?;
+
+        let rank = input_shape.len() as i64;
+        let normalized_axis = if axis < 0 { axis + rank } else { axis };
+        if normalized_axis < 0 || normalized_axis > rank {
+            return Err(OnnxError::InvalidShape(format!(
+                "Flatten axis {} out of range for input rank {}",
+                axis, rank
+            )));
+        }
+        let axis_usize = normalized_axis as usize;
+
+        // ONNX semantics: axis == 0 means output [1, prod(shape)]; axis == rank means [prod(shape), 1].
+        let outer: i64 = if axis_usize == 0 {
+            1
+        } else {
+            input_shape[..axis_usize].iter().product()
+        };
+        let inner: i64 = if axis_usize == input_shape.len() {
+            1
+        } else {
+            input_shape[axis_usize..].iter().product()
+        };
+
+        let mut options = Map::new();
+        options.insert("newShape".to_string(), serde_json::json!([outer, inner]));
+
+        let mut result = ConversionResult::new(vec![Node {
+            id: output_name.clone(),
+            op: "reshape".to_string(),
+            inputs: vec![input_id],
+            options,
+            outputs: None,
+        }]);
+
+        if let Some(out) = node.output.as_slice().first() {
+            result
+                .output_mappings
+                .insert(out.to_string(), output_name.clone());
+            if let Some(dtype) = context.value_types.get(&input_raw) {
+                result.output_types.insert(out.to_string(), dtype.clone());
             }
         }
 
