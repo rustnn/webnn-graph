@@ -66,6 +66,15 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-target-
 
+      # Cache the ResNet-50 ONNX model separately so it survives Cargo.lock churn
+      # and is not evicted as collateral damage when the target/ cache is invalidated.
+      # Static key — bump the suffix only if the upstream model URL changes.
+      - name: Cache ResNet-50 ONNX model
+        uses: actions/cache@v4
+        with:
+          path: target/test-data
+          key: resnet50-onnx-opset16-v1
+
       - name: Check formatting
         run: make fmt-check
 
