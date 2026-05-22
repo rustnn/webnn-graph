@@ -44,9 +44,15 @@ pub enum OnnxError {
 }
 
 /// Sanitize ONNX identifiers for WebNN DSL compatibility
-/// Replaces problematic characters that would confuse the parser
+/// Replaces problematic characters that would confuse the parser, and prefixes
+/// digit-leading names (e.g. anonymous ONNX outputs like "495") with `_` so they
+/// remain parseable in the .webnn text format.
 pub fn sanitize_identifier(name: &str) -> String {
-    identifiers::sanitize_for_webnn(name)
+    let base = identifiers::sanitize_for_webnn(name);
+    match base.chars().next() {
+        Some(c) if c.is_ascii_digit() => format!("_{}", base),
+        _ => base,
+    }
 }
 
 /// Convert ONNX data type code to WebNN DataType using shared utilities
@@ -429,6 +435,253 @@ fn infer_shape(
             }
 
             Some(target)
+        }
+
+        // Pooling: maxPool / averagePool / global variants.  Only handles fully-static inputs.
+        "MaxPool" | "AveragePool" => {
+            let ins = node.input.as_slice();
+            if ins.is_empty() {
+                return None;
+            }
+            let x_shape = value_shapes.get(ins[0].as_str())?.clone();
+            if x_shape.len() < 3 {
+                return None;
+            }
+            let spatial_rank = x_shape.len() - 2;
+
+            let mut auto_pad = String::from("NOTSET");
+            let mut strides: Vec<i64> = vec![1; spatial_rank];
+            let mut dilations: Vec<i64> = vec![1; spatial_rank];
+            let mut pads: Vec<i64> = vec![0; 2 * spatial_rank];
+            let mut kernel_shape: Vec<i64> = Vec::new();
+            let mut ceil_mode = false;
+            for attr in node.attribute.as_slice() {
+                match attr.name.as_str() {
+                    "auto_pad" => {
+                        if let Ok(s) = String::from_utf8(attr.s.clone()) {
+                            if !s.is_empty() {
+                                auto_pad = s;
+                            }
+                        }
+                    }
+                    "kernel_shape" if !attr.ints.is_empty() => kernel_shape = attr.ints.clone(),
+                    "strides" if !attr.ints.is_empty() => strides = attr.ints.clone(),
+                    "dilations" if !attr.ints.is_empty() => dilations = attr.ints.clone(),
+                    "pads" if !attr.ints.is_empty() => pads = attr.ints.clone(),
+                    "ceil_mode" => ceil_mode = attr.i != 0,
+                    _ => {}
+                }
+            }
+            if kernel_shape.len() != spatial_rank
+                || strides.len() != spatial_rank
+                || dilations.len() != spatial_rank
+                || pads.len() != 2 * spatial_rank
+            {
+                return None;
+            }
+
+            let mut out_spatial = Vec::with_capacity(spatial_rank);
+            for i in 0..spatial_rank {
+                let in_dim = x_shape[2 + i];
+                let k = kernel_shape[i];
+                let s = strides[i];
+                let d = dilations[i];
+                let dilated_k = d * (k - 1) + 1;
+                let out_dim = match auto_pad.as_str() {
+                    "SAME_UPPER" | "SAME_LOWER" => (in_dim + s - 1) / s,
+                    "VALID" => (in_dim - dilated_k) / s + 1,
+                    _ => {
+                        let pad_begin = pads[i];
+                        let pad_end = pads[i + spatial_rank];
+                        let numerator = in_dim + pad_begin + pad_end - dilated_k;
+                        if ceil_mode {
+                            (numerator + s - 1) / s + 1
+                        } else {
+                            numerator / s + 1
+                        }
+                    }
+                };
+                if out_dim < 0 {
+                    return None;
+                }
+                out_spatial.push(out_dim);
+            }
+
+            let mut out = vec![x_shape[0], x_shape[1]];
+            out.extend(out_spatial);
+            Some(out)
+        }
+
+        "GlobalMaxPool" | "GlobalAveragePool" => {
+            let ins = node.input.as_slice();
+            if ins.is_empty() {
+                return None;
+            }
+            let x_shape = value_shapes.get(ins[0].as_str())?.clone();
+            if x_shape.len() < 3 {
+                return None;
+            }
+            let mut out = vec![x_shape[0], x_shape[1]];
+            out.extend(std::iter::repeat_n(1i64, x_shape.len() - 2));
+            Some(out)
+        }
+
+        "Flatten" => {
+            let ins = node.input.as_slice();
+            if ins.is_empty() {
+                return None;
+            }
+            let x_shape = value_shapes.get(ins[0].as_str())?.clone();
+            let axis = node
+                .attribute
+                .as_slice()
+                .iter()
+                .find(|a| a.name.as_str() == "axis")
+                .map(|a| a.i)
+                .unwrap_or(1);
+            let rank = x_shape.len() as i64;
+            let norm = if axis < 0 { axis + rank } else { axis };
+            if norm < 0 || norm > rank {
+                return None;
+            }
+            let norm = norm as usize;
+            let outer: i64 = if norm == 0 {
+                1
+            } else {
+                x_shape[..norm].iter().product()
+            };
+            let inner: i64 = if norm == x_shape.len() {
+                1
+            } else {
+                x_shape[norm..].iter().product()
+            };
+            Some(vec![outer, inner])
+        }
+
+        // Convolution / transposed convolution: derive output spatial dims.
+        // Only handles fully-static inputs.  Higher-rank cases fall through to None.
+        "Conv" | "ConvTranspose" => {
+            let ins = node.input.as_slice();
+            if ins.len() < 2 {
+                return None;
+            }
+            let x_shape = value_shapes.get(ins[0].as_str())?.clone();
+            let w_shape = value_shapes.get(ins[1].as_str()).cloned().or_else(|| {
+                initializers
+                    .get(ins[1].as_str())
+                    .map(|t| t.dims.as_slice().to_vec())
+            })?;
+            if x_shape.len() < 3 || w_shape.len() < 3 {
+                return None;
+            }
+            let spatial_rank = x_shape.len() - 2;
+            if w_shape.len() != x_shape.len() {
+                return None;
+            }
+
+            // Read attributes.
+            let mut auto_pad = String::from("NOTSET");
+            let mut strides: Vec<i64> = vec![1; spatial_rank];
+            let mut dilations: Vec<i64> = vec![1; spatial_rank];
+            let mut pads: Vec<i64> = vec![0; 2 * spatial_rank];
+            let mut kernel_shape: Vec<i64> = w_shape[2..].to_vec();
+            let mut group: i64 = 1;
+            let mut output_padding: Vec<i64> = vec![0; spatial_rank];
+            let mut output_shape_attr: Vec<i64> = Vec::new();
+            for attr in node.attribute.as_slice() {
+                match attr.name.as_str() {
+                    "auto_pad" => {
+                        if let Ok(s) = String::from_utf8(attr.s.clone()) {
+                            if !s.is_empty() {
+                                auto_pad = s;
+                            }
+                        }
+                    }
+                    "strides" if !attr.ints.is_empty() => strides = attr.ints.clone(),
+                    "dilations" if !attr.ints.is_empty() => dilations = attr.ints.clone(),
+                    "pads" if !attr.ints.is_empty() => pads = attr.ints.clone(),
+                    "kernel_shape" if !attr.ints.is_empty() => kernel_shape = attr.ints.clone(),
+                    "group" if attr.i > 0 => group = attr.i,
+                    "output_padding" if !attr.ints.is_empty() => output_padding = attr.ints.clone(),
+                    "output_shape" if !attr.ints.is_empty() => {
+                        output_shape_attr = attr.ints.clone()
+                    }
+                    _ => {}
+                }
+            }
+            if strides.len() != spatial_rank
+                || dilations.len() != spatial_rank
+                || kernel_shape.len() != spatial_rank
+                || pads.len() != 2 * spatial_rank
+                || output_padding.len() != spatial_rank
+            {
+                return None;
+            }
+            let _ = group; // not needed for shape inference
+
+            let transpose = op == "ConvTranspose";
+            // Output channel count.
+            let m = if transpose {
+                // Filter layout for ConvTranspose: (C_in, M/group, kSpatial...).
+                // M = w_shape[1] * group, but with default group=1 we just use w_shape[1].
+                w_shape[1] * group
+            } else {
+                w_shape[0]
+            };
+
+            // If output_shape attr is provided (ConvTranspose), it directly tells us H/W.
+            if transpose && !output_shape_attr.is_empty() {
+                let sizes = if output_shape_attr.len() == spatial_rank {
+                    output_shape_attr.clone()
+                } else if output_shape_attr.len() == x_shape.len() {
+                    output_shape_attr[2..].to_vec()
+                } else {
+                    return None;
+                };
+                let mut out = vec![x_shape[0], m];
+                out.extend(sizes);
+                return Some(out);
+            }
+
+            let mut out_spatial = Vec::with_capacity(spatial_rank);
+            for i in 0..spatial_rank {
+                let in_dim = x_shape[2 + i];
+                let k = kernel_shape[i];
+                let s = strides[i];
+                let d = dilations[i];
+                let dilated_k = d * (k - 1) + 1;
+
+                let out_dim = match auto_pad.as_str() {
+                    "SAME_UPPER" | "SAME_LOWER" if !transpose => {
+                        // Standard "SAME": out = ceil(in / stride)
+                        (in_dim + s - 1) / s
+                    }
+                    "SAME_UPPER" | "SAME_LOWER" if transpose => {
+                        // For transpose: out = in * stride
+                        in_dim * s
+                    }
+                    "VALID" if !transpose => (in_dim - dilated_k) / s + 1,
+                    "VALID" if transpose => (in_dim - 1) * s + dilated_k,
+                    _ => {
+                        // explicit pads (NOTSET) — pads layout: [b1, b2, ..., bk, e1, e2, ..., ek]
+                        let pad_begin = pads[i];
+                        let pad_end = pads[i + spatial_rank];
+                        if transpose {
+                            (in_dim - 1) * s - pad_begin - pad_end + dilated_k + output_padding[i]
+                        } else {
+                            (in_dim + pad_begin + pad_end - dilated_k) / s + 1
+                        }
+                    }
+                };
+                if out_dim < 0 {
+                    return None;
+                }
+                out_spatial.push(out_dim);
+            }
+
+            let mut out = vec![x_shape[0], m];
+            out.extend(out_spatial);
+            Some(out)
         }
 
         "Slice" => {

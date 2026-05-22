@@ -29,3 +29,4 @@ webnn-onnx-utils = { git = "https://github.com/rustnn/webnn-onnx-utils", branch 
 
 [dev-dependencies]
 tempfile = "3.8"
+ureq = { version = "2.10", default-features = false, features = ["tls"] }

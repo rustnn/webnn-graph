@@ -24,6 +24,7 @@ impl OpHandler for ActivationHandler {
                 | "Erf"
                 | "Cos"
                 | "Sin"
+                | "Identity"
         )
     }
 
@@ -53,6 +54,7 @@ impl OpHandler for ActivationHandler {
             "Erf" => "erf",
             "Cos" => "cos",
             "Sin" => "sin",
+            "Identity" => "identity",
             _ => {
                 return Err(OnnxError::UnsupportedOp {
                     op: op_type.to_string(),
