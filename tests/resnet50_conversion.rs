@@ -32,8 +32,7 @@ fn locate_or_download_model() -> PathBuf {
     }
 
     eprintln!("Downloading {} -> {}", MODEL_URL, cached.display());
-    let mut builder =
-        ureq::AgentBuilder::new().timeout(std::time::Duration::from_secs(600));
+    let mut builder = ureq::AgentBuilder::new().timeout(std::time::Duration::from_secs(600));
     // Honor the conventional proxy env vars so the test works behind a corporate
     // proxy without code changes. ureq does not read these automatically.
     if let Some(proxy_url) = proxy_from_env() {
@@ -42,10 +41,7 @@ fn locate_or_download_model() -> PathBuf {
                 eprintln!("Using proxy from environment: {}", proxy_url);
                 builder = builder.proxy(proxy);
             }
-            Err(e) => eprintln!(
-                "Ignoring malformed proxy env var '{}': {}",
-                proxy_url, e
-            ),
+            Err(e) => eprintln!("Ignoring malformed proxy env var '{}': {}", proxy_url, e),
         }
     }
     let agent = builder.build();
@@ -136,7 +132,10 @@ fn resnet50_converts_validates_and_emits_js() {
         "expected exactly 1 averagePool2d node (global pool head)"
     );
     assert_eq!(relu, 49, "expected exactly 49 relu nodes");
-    assert_eq!(add, 17, "expected exactly 17 add nodes (16 residual + FC bias)");
+    assert_eq!(
+        add, 17,
+        "expected exactly 17 add nodes (16 residual + FC bias)"
+    );
     assert_eq!(matmul, 1, "expected exactly 1 matmul (final FC layer)");
     assert_eq!(reshape, 1, "expected exactly 1 reshape (from Flatten)");
     assert_eq!(graph.nodes.len(), 124, "expected exactly 124 total nodes");
@@ -192,14 +191,15 @@ fn resnet50_converts_validates_and_emits_js() {
     let flatten_reshape = graph
         .nodes
         .iter()
-        .find(|n| n.op == "reshape" && n.options.get("newShape") == Some(&serde_json::json!([1, 2048])))
+        .find(|n| {
+            n.op == "reshape" && n.options.get("newShape") == Some(&serde_json::json!([1, 2048]))
+        })
         .expect("flatten-as-reshape [1, 2048] not found");
     let _ = flatten_reshape; // assertion above is enough; kept binding for clarity.
 
     // Validate against the extracted manifest.
     let manifest_text = fs::read_to_string(&manifest_path).expect("read manifest");
-    let manifest: WeightsManifest =
-        serde_json::from_str(&manifest_text).expect("parse manifest");
+    let manifest: WeightsManifest = serde_json::from_str(&manifest_text).expect("parse manifest");
     validate_graph(&graph).expect("graph passes structural validation");
     validate_weights(&graph, &manifest).expect("manifest matches graph constants");
 
