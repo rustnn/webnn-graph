@@ -85,8 +85,8 @@ fn infer_shape(
 
     match op {
         // Unary operations that preserve shape
-        "Cast" | "Relu" | "Tanh" | "Sigmoid" | "Erf" | "Softmax" | "Gelu" | "Exp" | "Log"
-        | "Abs" | "Neg" | "Sqrt" | "LayerNormalization" | "Trilu" => {
+        "Cast" | "Relu" | "Tanh" | "Sigmoid" | "Softplus" | "Erf" | "Softmax" | "Gelu" | "Exp"
+        | "Log" | "Abs" | "Neg" | "Sqrt" | "LayerNormalization" | "Trilu" => {
             let ins = node.input.as_slice();
             if ins.is_empty() {
                 return None;
@@ -3088,6 +3088,23 @@ fn extract_weights_from_onnx(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn softplus_local_inference_preserves_shape() {
+        let node = crate::protos::onnx::NodeProto {
+            op_type: "Softplus".into(),
+            input: vec!["x".into()],
+            output: vec!["y".into()],
+            ..Default::default()
+        };
+        for shape in [vec![], vec![2, 3]] {
+            let shapes = HashMap::from([("x".into(), shape.clone())]);
+            assert_eq!(
+                infer_shape(&node, &shapes, &HashMap::new(), &HashMap::new()),
+                Some(shape)
+            );
+        }
+    }
 
     #[test]
     fn test_convert_options_default() {
