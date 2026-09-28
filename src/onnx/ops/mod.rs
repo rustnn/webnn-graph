@@ -3,7 +3,7 @@
 use crate::ast::{ConstDecl, Node};
 use crate::onnx::convert::OnnxError;
 use crate::protos::onnx::{NodeProto, TensorProto};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 
 pub mod activation;
@@ -118,6 +118,9 @@ pub struct ConversionResult {
     pub output_mappings: HashMap<String, String>,
     /// ONNX output name -> data type
     pub output_types: HashMap<String, crate::ast::DataType>,
+    /// Private values introduced by a decomposition, renamed against the whole
+    /// model before insertion so future ONNX outputs cannot collide with them.
+    pub private_values: Vec<String>,
 }
 
 impl ConversionResult {
@@ -127,7 +130,44 @@ impl ConversionResult {
             consts: Vec::new(),
             output_mappings: HashMap::new(),
             output_types: HashMap::new(),
+            private_values: Vec::new(),
         }
+    }
+
+    pub(crate) fn reserve_private_values(&mut self, reserved: &mut HashSet<String>) {
+        let mut renamed = HashMap::new();
+        for original in &self.private_values {
+            let mut candidate = original.clone();
+            let mut suffix = 1;
+            while !reserved.insert(candidate.clone()) {
+                candidate = format!("{}_{}", original, suffix);
+                suffix += 1;
+            }
+            renamed.insert(original.clone(), candidate);
+        }
+        let rename = |id: &mut String| {
+            if let Some(replacement) = renamed.get(id) {
+                *id = replacement.clone();
+            }
+        };
+        for (id, _) in &mut self.consts {
+            rename(id);
+        }
+        for node in &mut self.nodes {
+            rename(&mut node.id);
+            for input in &mut node.inputs {
+                rename(input);
+            }
+            if let Some(outputs) = &mut node.outputs {
+                for output in outputs {
+                    rename(output);
+                }
+            }
+        }
+        // Keep all inserted IDs reserved, including values produced by handlers
+        // that do not yet register their private intermediates explicitly.
+        reserved.extend(self.nodes.iter().map(|node| node.id.clone()));
+        reserved.extend(self.consts.iter().map(|(id, _)| id.clone()));
     }
 }
 

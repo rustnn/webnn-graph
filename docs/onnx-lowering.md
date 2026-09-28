@@ -1,7 +1,7 @@
 # ONNX to WebNN lowering
 
 The optional `onnx` feature converts ONNX models into the `GraphJson` AST and serializes them as `.webnn` or
-JSON. The converter accepts `ai.onnx` opsets 11 through 18. Other domains are retained for operator-specific
+JSON. The converter accepts `ai.onnx` opsets 11 through 20. Other domains are retained for operator-specific
 handling rather than being checked by the `ai.onnx` opset guard.
 
 ## Conversion flow
@@ -32,6 +32,24 @@ operation that requires a static reshape target, axis, permutation, slice bound,
 
 The exact supported behavior is operator- and opset-specific. Source tests are authoritative; this page does not
 claim that every variant of a named ONNX operator is supported.
+
+Standard-domain `Gelu` is supported from opset 20. Exact GELU (an absent `approximate` attribute or
+`"none"`) maps to WebNN `gelu`; `approximate="tanh"` lowers to the ONNX polynomial with
+`mul`/`add`/`tanh`, not to exact GELU. FP16 inputs are promoted to FP32 for the intermediate
+polynomial and rounded back to FP16 at the output. This avoids half-precision intermediate overflow
+and excessive negative-tail cancellation. Scalar inputs remain rank zero. Invalid approximation
+attributes fail conversion; the older `com.microsoft::Gelu` accepts no approximation attribute.
+
+The opset-19/20 audit preserves `AveragePool` dilation, and reductions resolve constant axes inputs,
+`keepdims=0`, and `noop_with_empty_axes`. Dynamic reduction axes still fail conversion. Added float8,
+bfloat16, string, sequence, and optional types remain unsupported rather than being reinterpreted as
+FP32. `Cast`'s float8-only `saturate` option has no effect on supported destination types. New operators
+without handlers (including `CastLike`, `Resize`, `QuantizeLinear`, `DequantizeLinear`, `GridSample`,
+`AffineGrid`, and `DFT`) remain explicit errors; accepting an opset does not claim every operator in it.
+
+`tests/onnx_gelu.rs` covers optimized/unoptimized full import, reference numerical results, typed
+constants, scalar inputs, generated-name collisions, and emitted JavaScript signatures. WebNN WPT
+does not import ONNX, so passing exact-GELU WPT is independent of support for ONNX's tanh variant.
 
 ## Constants and output artifacts
 
@@ -75,7 +93,7 @@ webnn-graph --debug convert-onnx --input model.onnx --optimize
 
 When conversion fails, first check:
 
-- whether the model uses `ai.onnx` opset 11–18;
+- whether the model uses `ai.onnx` opset 11–20;
 - whether every required symbolic dimension has an override or a usable bounded representation;
 - whether `--optimize` can fold the shape-producing expression;
 - whether the specific operator form and attributes have a registered lowering.

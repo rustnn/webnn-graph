@@ -5,7 +5,7 @@
 // ONNX MaxPool / AveragePool attributes (spatial-rank-aware):
 //   * kernel_shape:    required, length = spatial_rank
 //   * strides:         default = [1; spatial_rank]
-//   * dilations:       default = [1; spatial_rank]  (MaxPool only)
+//   * dilations:       default = [1; spatial_rank] (AveragePool since opset 19)
 //   * pads:            default = [0; 2*spatial_rank], layout [b1, b2, ..., e1, e2, ...]
 //   * auto_pad:        NOTSET | SAME_UPPER | SAME_LOWER | VALID
 //   * ceil_mode:       0 (floor) | 1 (ceil)
@@ -255,7 +255,7 @@ impl PoolHandler {
 
         options.insert("windowDimensions".to_string(), json!(kernel));
         options.insert("strides".to_string(), json!(strides));
-        // AveragePool in ONNX has no dilations; only emit dilations when non-default
+        // AveragePool gained dilation in opset 19; emit non-default values.
         // to keep generated calls minimal for the average case.
         if matches!(kind, PoolKind::Max) || dilations.iter().any(|&d| d != 1) {
             options.insert("dilations".to_string(), json!(dilations));

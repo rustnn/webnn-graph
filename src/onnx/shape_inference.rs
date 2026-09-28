@@ -156,7 +156,7 @@ fn seed_initializers(
             DataType::Int32 | DataType::Int64 | DataType::Uint32 | DataType::Uint64
         ) {
             let values = read_int_tensor(init);
-            if !values.is_empty() {
+            if !values.is_empty() || init.dims.contains(&0) {
                 result.const_values.insert(name, values);
             }
         }
@@ -871,21 +871,31 @@ fn infer_node_shape(node: &NodeProto, ctx: &InferenceResult) -> Option<Vec<i64>>
         "ReduceMean" | "ReduceSum" | "ReduceMax" | "ReduceMin" => {
             let input = node.input.as_slice().first()?;
             let input_shape = ctx.value_shapes.get(input)?;
-            let axes: Vec<i64> = node
+            let mut axes: Vec<i64> = node
                 .attribute
                 .as_slice()
                 .iter()
                 .find(|a| a.name.as_str() == "axes")
                 .map(|a| a.ints.clone())
                 .unwrap_or_default();
+            if let Some(input) = node.input.get(1).filter(|name| !name.is_empty()) {
+                axes = ctx.const_values.get(input)?.clone();
+            }
             let keepdims = node
                 .attribute
                 .as_slice()
                 .iter()
-                .find(|a| a.name.as_str() == "keepdims" && a.i != 0)
+                .find(|a| a.name.as_str() == "keepdims")
                 .map(|a| a.i != 0)
                 .unwrap_or(true);
             if axes.is_empty() {
+                if node
+                    .attribute
+                    .iter()
+                    .any(|a| a.name == "noop_with_empty_axes" && a.i != 0)
+                {
+                    return Some(input_shape.clone());
+                }
                 if keepdims {
                     Some(vec![1; input_shape.len()])
                 } else {

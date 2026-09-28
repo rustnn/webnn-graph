@@ -287,6 +287,7 @@ impl MatMulHandler {
             consts,
             output_mappings: std::collections::HashMap::new(),
             output_types: std::collections::HashMap::new(),
+            private_values: Vec::new(),
         };
 
         if let Some(output) = node.output.as_slice().first() {

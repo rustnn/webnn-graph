@@ -2,9 +2,7 @@
 
 use crate::ast::Node;
 use crate::onnx::convert::{sanitize_identifier, OnnxError};
-use crate::onnx::ops::{
-    normalize_axes_best_effort, ConversionContext, ConversionResult, OpHandler,
-};
+use crate::onnx::ops::{normalize_axes, ConversionContext, ConversionResult, OpHandler};
 use crate::protos::onnx::NodeProto;
 use serde_json::Map;
 
@@ -53,9 +51,9 @@ impl ReductionHandler {
         context: &ConversionContext,
     ) -> Result<ConversionResult, OnnxError> {
         let inputs = node.input.as_slice();
-        if inputs.is_empty() {
+        if inputs.is_empty() || inputs.len() > 2 {
             return Err(OnnxError::InvalidShape(format!(
-                "{} expects at least 1 input",
+                "{} expects 1 or 2 inputs",
                 webnn_op
             )));
         }
@@ -63,17 +61,48 @@ impl ReductionHandler {
         // Extract attributes
         let mut axes: Option<Vec<i64>> = None;
         let mut keepdims = 1i64; // ONNX default is 1 (keep dimensions)
+        let mut noop_with_empty_axes = false;
 
         for attr in node.attribute.as_slice() {
             match attr.name.as_str() {
                 "axes" => {
                     axes = Some(attr.ints.clone());
                 }
-                "keepdims" if attr.i != 0 => {
+                "keepdims" => {
                     keepdims = attr.i;
                 }
+                "noop_with_empty_axes" => noop_with_empty_axes = attr.i != 0,
                 _ => {}
             }
+        }
+        if let Some(axes_input) = inputs.get(1).filter(|name| !name.is_empty()) {
+            if axes.is_some() {
+                return Err(OnnxError::InvalidShape(format!(
+                    "{} '{}' specifies both an axes input and attribute",
+                    webnn_op, node_name
+                )));
+            }
+            axes = Some(
+                context
+                    .const_values
+                    .get(axes_input)
+                    .cloned()
+                    .ok_or_else(|| OnnxError::UnsupportedOp {
+                        op: format!("{} with nonconstant axes", node.op_type),
+                        node: node_name.to_string(),
+                    })?,
+            );
+        }
+        let empty_axes = axes.as_ref().is_none_or(Vec::is_empty);
+        // Identity is correct for the four supported reductions only. Composite
+        // reductions must retain their non-reduction steps (for example,
+        // ReduceLogSum still takes log and ReduceSumSquare still squares).
+        // They are rejected by supports()/convert(), not routed through here.
+        let no_op = empty_axes && noop_with_empty_axes;
+        // ONNX reduces every dimension for absent/empty axes unless noop=1;
+        // WebNN's explicitly empty axes instead mean no reduction.
+        if empty_axes {
+            axes = None;
         }
 
         let output_name = if node.output.as_slice().is_empty() {
@@ -89,7 +118,7 @@ impl ReductionHandler {
         // Add axes if specified
         if let Some(axes_values) = axes {
             let axes_values = if let Some(rank) = context.input_rank(inputs[0].as_str()) {
-                normalize_axes_best_effort(&axes_values, rank)
+                normalize_axes(&axes_values, rank)?
             } else {
                 axes_values
             };
@@ -104,9 +133,9 @@ impl ReductionHandler {
 
         let mut result = ConversionResult::new(vec![Node {
             id: output_name.clone(),
-            op: webnn_op.to_string(),
+            op: if no_op { "identity" } else { webnn_op }.to_string(),
             inputs: vec![input0],
-            options,
+            options: if no_op { Map::new() } else { options },
             outputs: None,
         }]);
 

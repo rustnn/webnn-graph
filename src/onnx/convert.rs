@@ -14,7 +14,7 @@ use thiserror::Error;
 use webnn_onnx_utils::{data_types as utils_data_types, identifiers};
 
 const MIN_SUPPORTED_OPSET: i64 = 11;
-const MAX_SUPPORTED_OPSET: i64 = 18;
+const MAX_SUPPORTED_OPSET: i64 = 20;
 
 #[derive(Debug, Error)]
 pub enum OnnxError {
@@ -32,6 +32,14 @@ pub enum OnnxError {
 
     #[error("missing required attribute: {attr} in {op}")]
     MissingAttribute { attr: String, op: String },
+
+    #[error("invalid attribute '{attr}' in {op} (node: {node}): {reason}")]
+    InvalidAttribute {
+        attr: String,
+        op: String,
+        node: String,
+        reason: String,
+    },
 
     #[error("invalid tensor shape: {0}")]
     InvalidShape(String),
@@ -72,6 +80,61 @@ pub(crate) fn map_onnx_data_type(onnx_type: i32) -> Result<DataType, OnnxError> 
         utils_data_types::DataType::Int8 => DataType::Int8,
         utils_data_types::DataType::Uint8 => DataType::Uint8,
     })
+}
+
+/// Check opset-19/20 type extensions before either import path folds constants.
+/// A foldable intermediate is not permission to reinterpret an unsupported type.
+fn validate_extended_opset_types(model: &ModelProto) -> Result<(), OnnxError> {
+    let graph = model
+        .graph
+        .as_ref()
+        .ok_or_else(|| OnnxError::ProtobufError("Missing graph in model".to_string()))?;
+    if !model.opset_import.iter().any(|import| {
+        (import.domain.is_empty() || import.domain == "ai.onnx") && import.version >= 19
+    }) {
+        return Ok(());
+    }
+    for value in graph
+        .input
+        .iter()
+        .chain(&graph.output)
+        .chain(&graph.value_info)
+    {
+        if let Some(type_proto) = &value.r#type {
+            match &type_proto.value {
+                Some(TypeProtoValue::TensorType(tensor)) => {
+                    map_onnx_data_type(tensor.elem_type)?;
+                }
+                _ => {
+                    return Err(OnnxError::UnsupportedOp {
+                        op: "non-tensor value type".to_string(),
+                        node: value.name.clone(),
+                    })
+                }
+            }
+        }
+    }
+    for tensor in &graph.initializer {
+        map_onnx_data_type(tensor.data_type)?;
+    }
+    for node in &graph.node {
+        for attribute in &node.attribute {
+            if let Some(tensor) = &attribute.t {
+                map_onnx_data_type(tensor.data_type)?;
+            }
+            if node.op_type == "Cast" && attribute.name == "to" {
+                map_onnx_data_type(i32::try_from(attribute.i).map_err(|_| {
+                    OnnxError::InvalidAttribute {
+                        attr: "to".to_string(),
+                        op: "Cast".to_string(),
+                        node: node.name.clone(),
+                        reason: "dtype code is out of range".to_string(),
+                    }
+                })?)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Infer output shape for an ONNX node based on its operation type and inputs
@@ -191,17 +254,29 @@ fn infer_shape(
                 .as_slice()
                 .iter()
                 .find(|a| a.name.as_str() == "keepdims")
-                .and_then(|a| if a.i != 0 { Some(a.i != 0) } else { None })
+                .map(|a| a.i != 0)
                 .unwrap_or(true);
 
             // Get axes attribute
-            let axes: Vec<i64> = node
+            let mut axes: Vec<i64> = node
                 .attribute
                 .as_slice()
                 .iter()
                 .find(|a| a.name.as_str() == "axes")
                 .map(|a| a.ints.clone())
                 .unwrap_or_default();
+
+            if let Some(input) = ins.get(1).filter(|name| !name.is_empty()) {
+                axes = const_values.get(input)?.clone();
+            }
+            if axes.is_empty()
+                && node
+                    .attribute
+                    .iter()
+                    .any(|a| a.name == "noop_with_empty_axes" && a.i != 0)
+            {
+                return Some(input_shape.clone());
+            }
 
             if axes.is_empty() {
                 // Reduce all dimensions
@@ -1393,6 +1468,32 @@ impl OnnxConverter {
         }
 
         let onnx_graph = self.model.graph.as_ref().unwrap();
+        let standard_opset = self
+            .model
+            .opset_import
+            .iter()
+            .find(|import| import.domain.is_empty() || import.domain == "ai.onnx")
+            .map(|import| import.version);
+        validate_extended_opset_types(&self.model)?;
+        for node in &onnx_graph.node {
+            if node.op_type == "Gelu"
+                && (node.domain.is_empty() || node.domain == "ai.onnx")
+                && standard_opset.is_none_or(|version| version < 20)
+            {
+                return Err(OnnxError::UnsupportedOp {
+                    op: "Gelu requires ai.onnx opset 20".to_string(),
+                    node: node.name.clone(),
+                });
+            }
+        }
+        let mut reserved_ids: HashSet<String> = onnx_graph
+            .node
+            .iter()
+            .flat_map(|node| node.input.iter().chain(&node.output))
+            .chain(onnx_graph.input.iter().map(|value| &value.name))
+            .chain(onnx_graph.initializer.iter().map(|value| &value.name))
+            .map(|name| sanitize_identifier(name))
+            .collect();
         let mut value_name_map: HashMap<String, String> = HashMap::new();
         let mut effective_overrides = options.free_dim_overrides.clone();
         let mut inference_overrides = effective_overrides.clone();
@@ -1568,10 +1669,6 @@ Provide --override-dim {}=<value> or enable --experimental-dynamic-inputs.",
                             raw_name
                         )));
                     };
-
-                    if shape.is_empty() {
-                        continue;
-                    }
 
                     self.graph.inputs.insert(
                         name.clone(),
@@ -2786,7 +2883,8 @@ Provide --override-dim {}=<value> or enable --experimental-dynamic-inputs.",
                 value_types: &value_types,
             };
 
-            let converted = registry.convert_node(onnx_node, &context)?;
+            let mut converted = registry.convert_node(onnx_node, &context)?;
+            converted.reserve_private_values(&mut reserved_ids);
 
             for (name, mut decl) in converted.consts {
                 if let crate::ast::ConstInit::InlineBytes { bytes } = &decl.init {
@@ -2894,6 +2992,8 @@ pub fn convert_onnx<P: AsRef<Path>>(
     // Parse protobuf
     let mut model: ModelProto =
         ModelProto::decode(&onnx_bytes[..]).map_err(|e| OnnxError::ProtobufError(e.to_string()))?;
+
+    validate_extended_opset_types(&model)?;
 
     // Apply constant folding if optimize flag is set
     if options.optimize {

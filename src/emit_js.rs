@@ -250,8 +250,18 @@ pub fn emit_builder_js(g: &GraphJson) -> String {
             .join(", ");
         let mut opts_val = serde_json::Value::Object(n.options.clone());
         normalize_options_for_js(&mut opts_val);
+        let cast_type = if n.op == "cast" {
+            opts_val
+                .as_object_mut()
+                .and_then(|options| options.remove("to"))
+        } else {
+            None
+        };
         let opts = opts_val.to_string();
-        let call = if ins.is_empty() {
+        let call = if let Some(dtype) = cast_type {
+            // WebNN takes the destination dtype positionally, not in options.
+            format!("builder[\"cast\"]({ins}, {dtype}, {opts})")
+        } else if ins.is_empty() {
             format!("builder[{op:?}]({opts})", op = n.op, opts = opts)
         } else {
             format!(
@@ -477,7 +487,7 @@ mod tests {
         });
         g.outputs.insert("y".to_string(), "y".to_string());
         let js = emit_builder_js(&g);
-        assert!(js.contains("\"to\":\"int32\""));
+        assert!(js.contains("builder[\"cast\"](env.get(\"x\"), \"int32\", {})"));
     }
 
     #[test]

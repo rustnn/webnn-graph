@@ -74,7 +74,7 @@ See [examples/README.md](examples/README.md) for the raw-weight workflow.
 
 ## ONNX conversion
 
-The converter accepts `ai.onnx` opsets 11 through 18. Static dimension overrides and optional constant
+The converter accepts `ai.onnx` opsets 11 through 20. Static dimension overrides and optional constant
 folding can resolve shape-critical ONNX expressions. Experimental bounded dynamic input metadata is available,
 but operations whose arguments must be static still require concrete values.
 
