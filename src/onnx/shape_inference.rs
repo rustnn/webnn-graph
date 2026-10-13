@@ -288,8 +288,8 @@ fn broadcast_shapes(a: &[i64], b: &[i64]) -> Option<Vec<i64>> {
 fn infer_node_shape(node: &NodeProto, ctx: &InferenceResult) -> Option<Vec<i64>> {
     let op = node.op_type.as_str();
     match op {
-        "Relu" | "Tanh" | "Sigmoid" | "Erf" | "Softmax" | "Gelu" | "Exp" | "Log" | "Abs"
-        | "Neg" | "Sqrt" | "LayerNormalization" => node
+        "Relu" | "Tanh" | "Sigmoid" | "Softplus" | "Erf" | "Softmax" | "Gelu" | "Exp" | "Log"
+        | "Abs" | "Neg" | "Sqrt" | "LayerNormalization" => node
             .input
             .as_slice()
             .first()

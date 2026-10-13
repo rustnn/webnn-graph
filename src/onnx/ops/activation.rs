@@ -1,4 +1,4 @@
-// Activation and unary math operators: Relu, Gelu, Tanh, Sigmoid, Sqrt, Exp, Log, Abs, Neg, Erf
+// Activation and unary math operators: Relu, Gelu, Tanh, Sigmoid, Softplus, Sqrt, Exp, Log, Abs, Neg, Erf
 
 use crate::ast::{ConstDecl, ConstInit, DataType, Node};
 use crate::onnx::convert::{sanitize_identifier, OnnxError};
@@ -17,6 +17,7 @@ impl OpHandler for ActivationHandler {
                 | "Gelu"
                 | "Tanh"
                 | "Sigmoid"
+                | "Softplus"
                 | "Sqrt"
                 | "Exp"
                 | "Log"
@@ -79,6 +80,7 @@ impl OpHandler for ActivationHandler {
             "Gelu" => "gelu",
             "Tanh" => "tanh",
             "Sigmoid" => "sigmoid",
+            "Softplus" => "softplus",
             "Sqrt" => "sqrt",
             "Exp" => "exp",
             "Log" => "log",
@@ -320,6 +322,7 @@ mod tests {
         assert!(handler.supports("Gelu"));
         assert!(handler.supports("Tanh"));
         assert!(handler.supports("Sigmoid"));
+        assert!(handler.supports("Softplus"));
         assert!(handler.supports("Sqrt"));
         assert!(handler.supports("Exp"));
         assert!(handler.supports("Log"));
