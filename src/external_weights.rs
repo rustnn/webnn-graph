@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use half::bf16;
 use safetensors::tensor::{Dtype as StDtype, TensorView};
+#[cfg(test)]
 use safetensors::SafeTensors;
 use serde::Deserialize;
 use thiserror::Error;
@@ -133,10 +134,10 @@ fn packed_byte_length(name: &str, shape: &[u32]) -> Result<usize, String> {
     Ok(logical_element_count(name, shape)?.div_ceil(2))
 }
 
-fn validate_packed4_marker(bytes: &[u8], path: &Path) -> Result<(), WeightResolveError> {
-    let (_, metadata) = SafeTensors::read_metadata(bytes).map_err(|error| {
-        WeightResolveError::Safetensors(format!("failed to read `{}`: {error}", path.display()))
-    })?;
+fn validate_packed4_marker(
+    metadata: &safetensors::tensor::Metadata,
+    path: &Path,
+) -> Result<(), WeightResolveError> {
     let marker = metadata
         .metadata()
         .as_ref()
@@ -182,10 +183,10 @@ fn bf16_bytes_to_f32_le_bytes(data: &[u8]) -> Result<Vec<u8>, WeightResolveError
 }
 
 fn safetensors_sanitized_name_map(
-    st: &SafeTensors<'_>,
+    st: &safetensors::tensor::Metadata,
 ) -> Result<HashMap<String, String>, WeightResolveError> {
     let mut out: HashMap<String, String> = HashMap::new();
-    for name in st.names() {
+    for name in st.tensors().keys() {
         let sanitized = sanitize_weight_key(name);
         if let Some(prev) = out.insert(sanitized.clone(), name.to_string()) {
             if prev.as_str() != name {
@@ -198,21 +199,58 @@ fn safetensors_sanitized_name_map(
     Ok(out)
 }
 
-fn resolve_tensor_view<'a>(
-    st: &'a SafeTensors<'a>,
+fn resolve_tensor_info<'a>(
+    st: &'a safetensors::tensor::Metadata,
     sanitized_map: &HashMap<String, String>,
-    r#ref: &str,
-) -> Result<safetensors::tensor::TensorView<'a>, WeightResolveError> {
-    if let Ok(v) = st.tensor(r#ref) {
-        return Ok(v);
+    name: &str,
+) -> Result<&'a safetensors::tensor::TensorInfo, WeightResolveError> {
+    st.info(name)
+        .or_else(|| sanitized_map.get(name).and_then(|n| st.info(n)))
+        .ok_or_else(|| {
+            WeightResolveError::Safetensors(format!(
+                "tensor `{name}` not found in safetensors archive"
+            ))
+        })
+}
+/// Read only the bounded header. Metadata's Deserialize validates shape sizes,
+/// contiguous offsets and overflow; the final extent must match the actual file.
+fn read_archive_header(
+    path: &Path,
+) -> Result<(fs::File, Vec<u8>, safetensors::tensor::Metadata), WeightResolveError> {
+    use std::io::Read;
+    let io = |source| WeightResolveError::ReadFile {
+        path: path.to_path_buf(),
+        source,
+    };
+    let bad = |message: String| {
+        WeightResolveError::Safetensors(format!("`{}`: {message}", path.display()))
+    };
+    let mut file = fs::File::open(path).map_err(io)?;
+    let len = file.metadata().map_err(io)?.len();
+    let mut size = [0u8; 8];
+    file.read_exact(&mut size).map_err(io)?;
+    let n = u64::from_le_bytes(size);
+    if n > 100_000_000 || n > len.saturating_sub(8) {
+        return Err(bad("invalid header size".into()));
     }
-    let orig = sanitized_map.get(r#ref).ok_or_else(|| {
-        WeightResolveError::Safetensors(format!("tensor `{ref}` not found in safetensors archive"))
-    })?;
-    st.tensor(orig.as_str())
-        .map_err(|e| WeightResolveError::Safetensors(format!("tensor `{ref}` (via `{orig}`): {e}")))
+    let mut bytes = vec![0; n as usize + 8];
+    bytes[..8].copy_from_slice(&size);
+    file.read_exact(&mut bytes[8..]).map_err(io)?;
+    let metadata: safetensors::tensor::Metadata =
+        serde_json::from_slice(&bytes[8..]).map_err(|e| bad(e.to_string()))?;
+    let end = metadata
+        .tensors()
+        .values()
+        .map(|t| t.data_offsets.1 as u64)
+        .max()
+        .unwrap_or(0);
+    if end.checked_add(n).and_then(|v| v.checked_add(8)) != Some(len) {
+        return Err(bad("archive payload length differs from header".into()));
+    }
+    Ok((file, bytes, metadata))
 }
 
+#[cfg(test)]
 fn read_file(path: &Path) -> Result<Vec<u8>, WeightResolveError> {
     fs::read(path).map_err(|source| WeightResolveError::ReadFile {
         path: path.to_path_buf(),
@@ -223,6 +261,7 @@ fn read_file(path: &Path) -> Result<Vec<u8>, WeightResolveError> {
 fn inline_weights_from_safetensors(
     graph_json: &mut GraphJson,
     safetensors_path: &Path,
+    mut consumer: Option<&mut WeightConsumer<'_>>,
 ) -> Result<(), WeightResolveError> {
     let weight_ref_count = graph_json
         .consts
@@ -235,24 +274,21 @@ fn inline_weights_from_safetensors(
         weight_ref_count
     );
 
-    let archive_bytes = read_file(safetensors_path)?;
-    let st = SafeTensors::deserialize(&archive_bytes).map_err(|e| {
-        WeightResolveError::Safetensors(format!("`{}`: {e}", safetensors_path.display()))
-    })?;
+    let (mut archive, archive_bytes, st) = read_archive_header(safetensors_path)?;
     let sanitized_map = safetensors_sanitized_name_map(&st)?;
     let has_packed_refs = graph_json.consts.values().any(|decl| {
         matches!(decl.data_type, AstDataType::Int4 | AstDataType::Uint4)
             && matches!(decl.init, ConstInit::Weights { .. })
     });
     if has_packed_refs {
-        validate_packed4_marker(&archive_bytes, safetensors_path)?;
+        validate_packed4_marker(&st, safetensors_path)?;
     }
 
     for (const_name, const_decl) in graph_json.consts.iter_mut() {
         let ConstInit::Weights { r#ref } = &const_decl.init else {
             continue;
         };
-        let view = match resolve_tensor_view(&st, &sanitized_map, r#ref) {
+        let info = match resolve_tensor_info(&st, &sanitized_map, r#ref) {
             Ok(v) => v,
             Err(e) => {
                 eprintln!(
@@ -263,6 +299,21 @@ fn inline_weights_from_safetensors(
                 return Err(e);
             }
         };
+
+        use std::io::{Read, Seek, SeekFrom};
+        let mut payload = vec![0; info.data_offsets.1 - info.data_offsets.0];
+        let io = |source| WeightResolveError::ReadFile {
+            path: safetensors_path.to_path_buf(),
+            source,
+        };
+        archive
+            .seek(SeekFrom::Start(
+                archive_bytes.len() as u64 + info.data_offsets.0 as u64,
+            ))
+            .map_err(io)?;
+        archive.read_exact(&mut payload).map_err(io)?;
+        let view = safetensors::tensor::TensorView::new(info.dtype, info.shape.clone(), &payload)
+            .map_err(|e| WeightResolveError::Safetensors(e.to_string()))?;
 
         if matches!(const_decl.data_type, AstDataType::Int4 | AstDataType::Uint4) {
             let expected = packed_byte_length(const_name, &const_decl.shape)
@@ -285,9 +336,12 @@ fn inline_weights_from_safetensors(
                     view.data().len()
                 )));
             }
-            const_decl.init = ConstInit::InlineBytes {
-                bytes: view.data().to_vec(),
+            let bytes = if let Some(sink) = consumer.as_deref_mut() {
+                sink(const_name, const_decl, payload)?
+            } else {
+                payload
             };
+            const_decl.init = ConstInit::InlineBytes { bytes };
             continue;
         }
         if !st_shape_matches_const(view.shape(), &const_decl.shape) {
@@ -307,7 +361,7 @@ fn inline_weights_from_safetensors(
         let st_dtype = view.dtype();
         let raw = view.data();
         let bytes = if safetensors_st_dtype_matches_ast(st_dtype, &const_decl.data_type) {
-            raw.to_vec()
+            payload
         } else if matches!(
             (&const_decl.data_type, st_dtype),
             (AstDataType::Float32, StDtype::BF16)
@@ -344,6 +398,11 @@ fn inline_weights_from_safetensors(
             return Err(WeightResolveError::Safetensors(msg));
         };
 
+        let bytes = if let Some(sink) = consumer.as_deref_mut() {
+            sink(const_name, const_decl, bytes)?
+        } else {
+            bytes
+        };
         const_decl.init = ConstInit::InlineBytes { bytes };
     }
 
@@ -381,13 +440,20 @@ fn inline_weights_from_manifest(
     graph_json: &mut GraphJson,
     manifest_path: &Path,
     weights_path: &Path,
+    mut consumer: Option<&mut WeightConsumer<'_>>,
 ) -> Result<(), WeightResolveError> {
     let manifest_text =
         fs::read_to_string(manifest_path).map_err(|source| WeightResolveError::ReadFile {
             path: manifest_path.to_path_buf(),
             source,
         })?;
-    let weights_bytes = read_file(weights_path)?;
+    use std::io::{Read, Seek, SeekFrom};
+    let io = |source| WeightResolveError::ReadFile {
+        path: weights_path.to_path_buf(),
+        source,
+    };
+    let mut weights = fs::File::open(weights_path).map_err(io)?;
+    let weights_len = weights.metadata().map_err(io)?.len();
 
     let manifest: FlexibleManifest = serde_json::from_str(&manifest_text).map_err(|source| {
         WeightResolveError::ManifestJson {
@@ -443,16 +509,24 @@ fn inline_weights_from_manifest(
         let end = start.checked_add(len).ok_or_else(|| {
             WeightResolveError::Manifest(format!("byte range overflow for `{ref}`"))
         })?;
-        if end > weights_bytes.len() {
+        if end as u64 > weights_len {
             return Err(WeightResolveError::Manifest(format!(
                 "byte range [{start}, {end}) for `{ref}` exceeds weights file length {} (`{}`)",
-                weights_bytes.len(),
+                weights_len,
                 weights_path.display()
             )));
         }
-        const_decl.init = ConstInit::InlineBytes {
-            bytes: weights_bytes[start..end].to_vec(),
+        let mut bytes = vec![0; len];
+        weights
+            .seek(SeekFrom::Start(entry.byte_offset))
+            .map_err(io)?;
+        weights.read_exact(&mut bytes).map_err(io)?;
+        let bytes = if let Some(sink) = consumer.as_deref_mut() {
+            sink(const_name, const_decl, bytes)?
+        } else {
+            bytes
         };
+        const_decl.init = ConstInit::InlineBytes { bytes };
     }
     Ok(())
 }
@@ -532,11 +606,44 @@ fn path_looks_like_safetensors(path: &Path) -> bool {
 ///
 /// Incomplete SafeTensors resolution returns [`WeightResolveError::Safetensors`]; manifest errors use
 /// [`WeightResolveError::Manifest`] / [`WeightResolveError::ManifestJson`].
+type WeightConsumer<'a> =
+    dyn FnMut(&str, &crate::ast::ConstDecl, Vec<u8>) -> Result<Vec<u8>, WeightResolveError> + 'a;
+
 pub fn resolve_external_weights(
     graph_json: &mut GraphJson,
     graph_path: &Path,
     weights_path: Option<&str>,
     manifest_path: Option<&str>,
+) -> Result<(), WeightResolveError> {
+    resolve_external_weights_impl(graph_json, graph_path, weights_path, manifest_path, None)
+}
+
+/// Resolve one external tensor at a time through a consuming sink. The returned
+/// replacement bytes become the declaration's inline payload. A sink may return
+/// an empty vector only when it retains equivalent external storage separately;
+/// that graph is then metadata for that consumer, not a standalone resolved AST.
+pub fn resolve_external_weights_with_consumer(
+    graph_json: &mut GraphJson,
+    graph_path: &Path,
+    weights_path: Option<&str>,
+    manifest_path: Option<&str>,
+    consumer: &mut WeightConsumer<'_>,
+) -> Result<(), WeightResolveError> {
+    resolve_external_weights_impl(
+        graph_json,
+        graph_path,
+        weights_path,
+        manifest_path,
+        Some(consumer),
+    )
+}
+
+fn resolve_external_weights_impl(
+    graph_json: &mut GraphJson,
+    graph_path: &Path,
+    weights_path: Option<&str>,
+    manifest_path: Option<&str>,
+    consumer: Option<&mut WeightConsumer<'_>>,
 ) -> Result<(), WeightResolveError> {
     eprintln!(
         "[webnn graph] resolve external weights: graph={}, weights_path={}, manifest_path={}",
@@ -575,7 +682,7 @@ pub fn resolve_external_weights(
     };
 
     if path_looks_like_safetensors(&wp) {
-        return inline_weights_from_safetensors(graph_json, &wp);
+        return inline_weights_from_safetensors(graph_json, &wp, consumer);
     }
 
     let mp = if let Some(s) = manifest_path {
@@ -599,7 +706,7 @@ pub fn resolve_external_weights(
         })?
     };
 
-    inline_weights_from_manifest(graph_json, &mp, &wp)
+    inline_weights_from_manifest(graph_json, &mp, &wp, consumer)
 }
 
 fn temporary_archive_path(path: &Path) -> PathBuf {
@@ -1293,5 +1400,160 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("not found"));
+    }
+    #[test]
+    fn consuming_sink_owns_payload_and_replaces_inline_bytes() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("model.webnn");
+        let archive = path.with_extension("safetensors");
+        write_test_archive(
+            &archive,
+            vec![
+                ("a".into(), Dtype::I8, vec![2], vec![0x80, 0x7f]),
+                (
+                    "b".into(),
+                    Dtype::F32,
+                    vec![1],
+                    1.25f32.to_le_bytes().to_vec(),
+                ),
+            ],
+            None,
+        );
+        let original = external_graph(vec![
+            ("a", AstDataType::Int8, vec![2], "a"),
+            ("b", AstDataType::Float32, vec![1], "b"),
+        ]);
+        let mut inline = original.clone();
+        resolve_external_weights(&mut inline, &path, None, None).unwrap();
+        let mut graph = original.clone();
+        let mut retained = BTreeMap::new();
+        resolve_external_weights_with_consumer(
+            &mut graph,
+            &path,
+            None,
+            None,
+            &mut |name, decl, bytes| {
+                assert!(matches!(decl.init, ConstInit::Weights { .. }));
+                retained.insert(name.to_string(), bytes);
+                Ok(vec![])
+            },
+        )
+        .unwrap();
+        assert_eq!(retained.len(), 2);
+        for (name, decl) in &inline.consts {
+            let ConstInit::InlineBytes { bytes } = &decl.init else {
+                panic!()
+            };
+            assert_eq!(retained[name], *bytes);
+            assert!(
+                matches!(&graph.consts[name].init, ConstInit::InlineBytes { bytes } if bytes.is_empty())
+            );
+        }
+        let mut graph = original;
+        resolve_external_weights_with_consumer(
+            &mut graph,
+            &path,
+            None,
+            None,
+            &mut |_, _, bytes| Ok(bytes),
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(graph).unwrap(),
+            serde_json::to_value(inline).unwrap()
+        );
+    }
+
+    #[test]
+    fn consuming_sink_error_is_propagated_without_replacing_the_payload() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("model.webnn");
+        write_safetensors_f32(
+            &path.with_extension("safetensors"),
+            "w",
+            vec![1],
+            &1f32.to_le_bytes(),
+        );
+        let mut graph = external_graph(vec![("w", AstDataType::Float32, vec![1], "w")]);
+        let err = resolve_external_weights_with_consumer(
+            &mut graph,
+            &path,
+            None,
+            None,
+            &mut |_, _, _| Err(WeightResolveError::Manifest("sink failed".into())),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("sink failed"));
+        assert!(matches!(graph.consts["w"].init, ConstInit::Weights { .. }));
+    }
+
+    #[test]
+    fn streaming_header_rejects_truncated_extended_and_oversized_archives_before_sink() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("model.webnn");
+        let archive = path.with_extension("safetensors");
+        write_safetensors_f32(&archive, "w", vec![1], &1f32.to_le_bytes());
+        let original = fs::read(&archive).unwrap();
+        for bytes in [
+            original[..original.len() - 1].to_vec(),
+            [original.clone(), vec![0]].concat(),
+            u64::MAX.to_le_bytes().to_vec(),
+        ] {
+            fs::write(&archive, bytes).unwrap();
+            let mut graph = external_graph(vec![("w", AstDataType::Float32, vec![1], "w")]);
+            let mut called = false;
+            assert!(resolve_external_weights_with_consumer(
+                &mut graph,
+                &path,
+                None,
+                None,
+                &mut |_, _, bytes| {
+                    called = true;
+                    Ok(bytes)
+                }
+            )
+            .is_err());
+            assert!(!called);
+        }
+    }
+
+    #[test]
+    fn consuming_manifest_reads_only_requested_span_and_preserves_error_contract() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("model.webnn");
+        fs::write(path.with_extension("weights"), [9, 0x80, 0x7f, 8]).unwrap();
+        let manifest = path.with_extension("manifest.json");
+        fs::write(
+            &manifest,
+            r#"{"tensors":{"w":{"byteOffset":1,"byteLength":2}}}"#,
+        )
+        .unwrap();
+        let mut graph = external_graph(vec![("w", AstDataType::Int8, vec![2], "w")]);
+        resolve_external_weights_with_consumer(
+            &mut graph,
+            &path,
+            None,
+            None,
+            &mut |name, _, bytes| {
+                assert_eq!(name, "w");
+                assert_eq!(bytes, vec![0x80, 0x7f]);
+                Ok(bytes)
+            },
+        )
+        .unwrap();
+        fs::write(
+            &manifest,
+            r#"{"tensors":{"w":{"byteOffset":18446744073709551615,"byteLength":2}}}"#,
+        )
+        .unwrap();
+        let mut graph = external_graph(vec![("w", AstDataType::Int8, vec![2], "w")]);
+        assert!(resolve_external_weights_with_consumer(
+            &mut graph,
+            &path,
+            None,
+            None,
+            &mut |_, _, _| panic!("invalid span reached sink")
+        )
+        .is_err());
     }
 }
