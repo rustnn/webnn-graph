@@ -133,3 +133,13 @@ cargo test --no-default-features
 ```
 
 The repository keeps prose lines at or below 120 characters.
+
+### Consuming local external weights
+
+`external_weights::resolve_external_weights_with_consumer` resolves validated
+SafeTensors or manifest-backed payloads one at a time and transfers ownership to
+a caller-provided sink. Replacement bytes become the inline AST payload. An empty
+replacement is only valid when the caller retains equivalent external storage;
+the resulting AST is then metadata for that consumer, not a standalone graph.
+The existing resolver retains its original inline behavior. This setup API does
+not execute inference or require a network connection.
