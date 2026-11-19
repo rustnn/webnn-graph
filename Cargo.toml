@@ -16,9 +16,11 @@ path = "src/lib.rs"
 [[bin]]
 name = "webnn-graph"
 path = "src/main.rs"
+required-features = ["cli"]
 
 [features]
-default = ["onnx"]
+default = ["onnx", "cli"]
+cli = ["dep:clap"]
 onnx = ["dep:webnn-onnx-utils", "dep:prost"]
 
 [dependencies]
@@ -30,7 +32,7 @@ half = "2.7.1"
 thiserror = "1.0"
 pest = "2.7"
 pest_derive = "2.7"
-clap = { version = "4.5", features = ["derive"] }
+clap = { version = "4.5", features = ["derive"], optional = true }
 base64 = "0.22"
 prost = { version = "0.12", optional = true }
 webnn-onnx-utils = { version = "0.1.1", optional = true }

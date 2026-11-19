@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog and this project follows Semantic Versioning.
 
+## [Unreleased]
+
+### Changed
+- `clap` is optional, behind a new default `cli` feature that also gates the `webnn-graph` binary;
+  `--no-default-features` builds the library without it.
+
 ## [0.4.0] - 2026-10-15
 
 ### Added
