@@ -29,8 +29,9 @@ cargo build
 cargo test
 ```
 
-ONNX conversion is enabled by the default `onnx` feature. Build only the parser, serializer, validators,
-emitters, and weight utilities with:
+ONNX conversion is enabled by the default `onnx` feature, and the `webnn-graph` binary by the default `cli`
+feature (which pulls in `clap`). Build only the parser, serializer, validators, emitters, and weight utilities
+with:
 
 ```bash
 cargo build --no-default-features
